@@ -927,12 +927,12 @@ class TransformerLm(base_layer.BaseLayer):
     # when time_step > 0.
     ngrammer_prefix = self.get_decode_state('ngrammer_prefix')
     ngrammer_prefix_emb = self.get_decode_state('ngrammer_prefix_emb')
-    ngrammer_segment_pos_prefix = self.get_decode_state(
-        'ngrammer_prefix_segment_pos'
-    )
     input_ids = jnp.concatenate([ngrammer_prefix, input_ids], axis=1)
     input_emb = jnp.concatenate([ngrammer_prefix_emb, input_emb], axis=1)
     if segment_pos is not None:
+      ngrammer_segment_pos_prefix = self.get_decode_state(
+          'ngrammer_prefix_segment_pos'
+      )
       segment_pos = jnp.concatenate(
           [ngrammer_segment_pos_prefix, segment_pos], axis=1
       )
@@ -952,9 +952,10 @@ class TransformerLm(base_layer.BaseLayer):
 
     Returns:
       A NestedMap of:
-      - logits: [B, T, D]
-      - log_probs: [B, T, D]
-      - probs: [B, T, D]
+      - logits: [B, T, vocab_size]
+      - log_probs: [B, T, vocab_size]
+      - probs: [B, T, vocab_size]
+      - activations: [B, T, D]
     """
     del segment_pos
     logits = self.softmax.get_logits(inputs=activations, input_ids=input_ids)
@@ -966,6 +967,8 @@ class TransformerLm(base_layer.BaseLayer):
         logits_dtype
     )
     xent_output.probs = jax.nn.softmax(casted_logits).astype(logits_dtype)
+    if self.record_activations_in_xent_output:
+      xent_output.activations = activations
     return xent_output
 
   def extend_step(

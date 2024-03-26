@@ -40,7 +40,7 @@ instantiate = base_layer.instantiate
 
 def _generate_quantization_types_modes() -> Sequence[dict[str, Any]]:
   keys = ['testcase_name', 'quantization_type', 'mode', 'precision']
-  types = [QuantizationType.PTQ, QuantizationType.AQT]
+  types = [QuantizationType.PTQ, QuantizationType.AQT, QuantizationType.FQ]
   modes = [QuantizationMode.INFERENCE, QuantizationMode.TRAINING]
   precisions = [8, 4]
 
@@ -72,6 +72,9 @@ class QuantizedAttentionTest(test_utils.TestCase):
             quantization_type=quantization_type,
             mode=mode,
             weight_params=quantization_hparams.WeightQuantizationParams(
+                precision=precision,
+            ),
+            act_params=quantization_hparams.ActQuantizationParams(
                 precision=precision,
             ),
         ),
@@ -135,6 +138,9 @@ class QuantizedAttentionTest(test_utils.TestCase):
             quantization_type=quantization_type,
             mode=mode,
             weight_params=quantization_hparams.WeightQuantizationParams(
+                precision=precision,
+            ),
+            act_params=quantization_hparams.ActQuantizationParams(
                 precision=precision,
             ),
         ),
@@ -260,7 +266,7 @@ class QuantizedAttentionSyncTest(test_utils.TestCase):
     attn_q = instantiate(p_q)
     inputs = np.random.normal(1.5, 2.0, [2, 16, 16]).astype(np.float32)
     prng_key = jax.random.PRNGKey(seed=123)
-    prng_key, init_key = jax.random.split(prng_key)
+    _, init_key = jax.random.split(prng_key)
     initial_vars_f = attn_f.init(init_key, inputs)
     initial_vars_q = attn_q.init(init_key, inputs)
     assert_var_stats_close(
@@ -347,7 +353,7 @@ class QuantizedAttentionSyncTest(test_utils.TestCase):
     atten_q = instantiate(atten_q_p)
 
     prng_key = jax.random.PRNGKey(seed=123)
-    prng_key, init_key = jax.random.split(prng_key)
+    _, init_key = jax.random.split(prng_key)
     target_batch_size = 3
     source_max_length = 16
     target_max_length = 16
@@ -477,8 +483,8 @@ class QuantizeAttentionTest(test_utils.TestCase):
       res, _ = layer.apply(
           initial_vars, mutable=[], method=layer.quantize_weight)
 
-    self.assertEqual(len(res), 1)
-    self.assertEqual(len(res[base_layer.PARAMS]), 3 if use_bias else 2)
+    self.assertLen(res, 1)
+    self.assertLen(res[base_layer.PARAMS], 3 if use_bias else 2)
     self.assertEqual(res[base_layer.PARAMS]['w'].shape, (2, 5, 16))
     self.assertEqual(res[base_layer.PARAMS]['w_quantized_scale'].shape, (16,))
     if use_bias:
@@ -503,6 +509,50 @@ class QuantizeAttentionTest(test_utils.TestCase):
         'params': expected_pspec_params,
     }
     self.assertEqual(pspec, expected_pspec)
+
+  @parameterized.parameters(0, 2)
+  def test_quantize_attention_projection_sub_channel(self, block_size):
+    p = pax_fiddle.Config(
+        qattentions.AttentionProjection,
+        name='_attn_proj_q',
+        mesh_axis_names=['replica', 'mdl', 'data'],
+        weight_split_dims_mapping=base_layer.BaseLayer.WeightSharding(
+            wt=['mdl', 'data']
+        ),
+        quantization=QuantizationParams(
+            quantization_type=QuantizationType.PTQ,
+            mode=QuantizationMode.TRAINING,
+            weight_params=quantization_hparams.WeightQuantizationParams(
+                block_size=block_size,
+            ),
+        ),
+        use_bias=True,
+    )
+    p.input_dim = 32
+    p.num_heads = 4
+    p.dim_per_head = 8
+    p.is_output_projection = True
+    p.use_nhd_shape = True
+    layer = instantiate(p)
+    inputs = np.random.normal(1.5, 2.0, [8, 4, 8]).astype(np.float32)
+
+    with base_layer.JaxContext.new_context():
+      prng_key = jax.random.PRNGKey(seed=123)
+      initial_vars = layer.init(prng_key, inputs)
+      res, _ = layer.apply(
+          initial_vars, mutable=[], method=layer.quantize_weight
+      )
+
+    self.assertEqual(res[base_layer.PARAMS]['w'].dtype, jnp.int8)
+
+    if block_size == 0:
+      self.assertEqual(res[base_layer.PARAMS]['w'].shape, (4, 8, 32))
+      self.assertEqual(res[base_layer.PARAMS]['w_quantized_scale'].shape, (32,))
+    elif block_size == 2:
+      self.assertEqual(res[base_layer.PARAMS]['w'].shape, (4, 4, 2, 32))
+      self.assertEqual(
+          res[base_layer.PARAMS]['w_quantized_scale'].shape, (2, 32)
+      )
 
   @parameterized.product(
       quantization_type=[QuantizationType.PTQ, QuantizationType.AQT],
@@ -544,7 +594,7 @@ class QuantizeAttentionTest(test_utils.TestCase):
           initial_vars, mutable=[], method=layer.quantized_partition_specs
       )
 
-    self.assertEqual(len(res), 1)
+    self.assertLen(res, 1)
 
     shapes = jax.tree_map(lambda x: x.shape, res)
     types = jax.tree_map(lambda x: x.dtype, res)
@@ -585,6 +635,57 @@ class QuantizeAttentionTest(test_utils.TestCase):
     self.assertEqual(shapes, expected_shape)
     self.assertEqual(types, expected_types)
     self.assertEqual(pspec, expected_pspec)
+
+
+class AttentionProjectionLoRATest(test_utils.TestCase):
+  """Quantize attention."""
+
+  def setUp(self):
+    super().setUp()
+    np.random.seed(123456)
+
+  @parameterized.parameters(
+      (None, False),
+      (None, True),
+      ('pre', False),
+      ('mid', False),
+      ('post', False),
+  )
+  def test_attention_projection_lora(self, norm_order, max_reduction):
+    p = pax_fiddle.Config(
+        qattentions.AttentionProjectionLoRA,
+        name='_attn_proj_q',
+        mesh_axis_names=['replica', 'mdl', 'data'],
+        weight_split_dims_mapping=base_layer.BaseLayer.WeightSharding(
+            wt=['mdl', 'data']
+        ),
+        quantization=QuantizationParams(
+            mode=QuantizationMode.TRAINING,
+        ),
+    )
+    p.input_dim = 16
+    p.num_heads = 2
+    p.dim_per_head = 5
+    p.lora_rank = 2
+    p.is_output_projection = True
+    p.use_nhd_shape = True
+    p.max_reduction = max_reduction
+    p.norm_order = norm_order
+
+    layer = instantiate(p)
+    inputs = np.random.normal(1.5, 2.0, [5, 2, 5]).astype(np.float32)
+
+    with base_layer.JaxContext.new_context():
+      prng_key = jax.random.PRNGKey(seed=123)
+      initial_vars = layer.init(prng_key, inputs)
+      outputs = layer.apply(initial_vars, inputs)
+
+    self.assertEqual(outputs.shape, (5, 16))
+    if max_reduction:
+      self.assertEqual(initial_vars['params']['w_left'].shape, (5, 2))
+    else:
+      self.assertEqual(initial_vars['params']['w_left'].shape, (2, 5, 2, 2))
+    self.assertEqual(initial_vars['params']['w_right'].shape, (2, 2, 16))
 
 
 if __name__ == '__main__':

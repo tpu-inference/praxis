@@ -47,6 +47,7 @@ class SparsityType(str, enum.Enum):
 
   STRUCTURED_NM = 'structured_nm'
   UNSTRUCTURED = 'unstructured'
+  CHANNELWISE_PRUNING = 'channelwise_pruning'
 
 
 @dataclasses.dataclass
@@ -99,6 +100,14 @@ class WeightSparsityParams:
     sparse_ste_weight: Denotes the relative weight for the sparse-refined term.
       As mentioned in the paper (https://arxiv.org/abs/2102.04010), the best
       default value is 0.0002 (lambda_w in the paper).
+    offset:  Indicates the offset between the group of M elements on which
+      N:M sparsity is applied. The default is `0` (narrowly-separated),
+        indicating that `M` elements are selected from adjacent values in the
+        input matrix. Generally, because of the XLA layout (lanes 128/sublanes
+        8), another value for offset would be 128 (widely-separated). If offset
+        > 0, we only support scenarios where the input array size is equal to
+        (offset * m). Offset != 128 may not be best optimized for the memory
+        layout.
   """
 
   # TODO(ayazdan): Add additional sparsity parameters (order, offset, etc.)
@@ -107,6 +116,7 @@ class WeightSparsityParams:
   mask_decay_weight: float = 0.0
   sparse_ste: bool = False
   sparse_ste_weight: float = 0.0002
+  offset: int = 0
 
   def __post_init__(self):
     assert self.mask_decay_weight >= 0.0, (
@@ -129,6 +139,24 @@ class WeightSparsityParams:
             'SR-STE only works with non-decaying sparse structure.'
         )
 
+    assert self.offset >= 0, 'Offset must be positive.'
+
+# NOTE: Pay attention to which dimension, and type of tensor being sparsified.
+# Some hardware may support sparsity along the reduction dimension alone. This
+# would translate to `C' i.e., column-wise pruning for weights, and `R' i.e.,
+# row-wise pruning for activations. Enforcing the correct order may be required
+# to suitably target hardware capabilities.
+@enum.unique
+class SparsityOrder(str, enum.Enum):
+  """The different index order to apply pruning.
+
+  `C` Column wise pruning.
+  `R` Rows wise pruning.
+  """
+
+  C = 'C'
+  R = 'R'
+
 
 @dataclasses.dataclass
 class SparsityHParams:
@@ -146,9 +174,15 @@ class SparsityHParams:
       sparsity
     order: Apply pruning using this index order. Supported values are `C`, `R`.
       `C` and `R` indicate column-wise and row-wise masking, respectively.
-      Default is `R` indicating to applying N:M sparsity across rows of the
-      input matrix.
+      Default is `C` indicating to applying N:M sparsity across columns of the
+      input matrix. The choice may intersect with hardware capabilities, that
+      support sparsity only along a reduction dimension. For a weight tensor `C`
+      corresponds to the reduction dimension, and `R' for activations.
     track_sad_metric: Should we track sparse architecture divergence metric?
+    topk_estimator_type: Sets the type of top-k mask learning.
+    channelwise_pruning_dim: dimension along which we would want to do
+      channelwise pruning.
+    block_size: Number of values in each weight block.
   """
 
   sparsity_type: SparsityType = SparsityType.STRUCTURED_NM
@@ -159,8 +193,13 @@ class SparsityHParams:
   score: SparsityScore = SparsityScore.MAGNITUDE
   sparsified_layers: list[int] | None = None
   polynomial_decay_schedule: PolynomialDecayParams | None = None
-  order: str = 'R'
+  order: SparsityOrder = SparsityOrder.C
   track_sad_metric: bool = False
+  topk_estimator_type: str | None = None
+  # TODO enable per layer dim i.e. linear 1 and 2
+  # Enable unstacking
+  channelwise_pruning_dim: int = -1
+  block_size: int = 0
 
   def __post_init__(self):
     if (
@@ -183,8 +222,25 @@ class SparsityHParams:
         if self.weight_params.sparse_ste:
           raise ValueError('SR-STE only works with structured sparsity.')
 
+      elif self.sparsity_type == SparsityType.CHANNELWISE_PRUNING:
+        if self.weight_params.prune_rate is not None:
+          assert isinstance(self.weight_params.prune_rate, float), (
+              'Prune rate must be either None or float '
+              'for unstructured sparsity.'
+          )
+        if self.weight_params.sparse_ste:
+          raise ValueError('SR-STE only works with structured sparsity.')
+
       else:
         assert False, f'Unrecognized sparsity type {self.sparsity_type}.'
 
       if self.order not in ['C', 'R']:
         raise ValueError(f'Index order {self.order} not supported.')
+
+      if self.block_size != 0:
+        assert self.block_size > 0, 'Block size must be positive.'
+        if self.sparsity_type != SparsityType.STRUCTURED_NM:
+          raise ValueError(
+              f'Block size {self.block_size} not supported for '
+              'unstructured sparsity.'
+          )

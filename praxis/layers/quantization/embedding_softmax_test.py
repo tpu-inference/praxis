@@ -18,6 +18,7 @@
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+import jax.numpy as jnp
 import numpy as np
 from praxis import base_layer
 from praxis import pax_fiddle
@@ -25,6 +26,7 @@ from praxis import test_utils
 from praxis.layers import embedding_softmax
 from praxis.layers import quantization
 from praxis.layers.quantization import quantization_hparams
+from praxis.layers.quantization import utils
 
 instantiate = base_layer.instantiate
 WeightInit = base_layer.WeightInit
@@ -246,6 +248,7 @@ class SharedEmbeddingSoftmaxTest(test_utils.TestCase):
     np.random.seed(123456)
 
   @parameterized.product(
+      precision=[4, 8],
       quantization_type=[
           QuantizationType.PTQ,
           QuantizationType.AQT,
@@ -253,14 +256,27 @@ class SharedEmbeddingSoftmaxTest(test_utils.TestCase):
       ],
       use_symmetric=[True, False],
       lookup_style=['index', 'matmul'],
+      use_native_types=[True, False],
   )
   def test_quantized_inference(
-      self, quantization_type, use_symmetric, lookup_style
+      self,
+      precision,
+      quantization_type,
+      use_symmetric,
+      lookup_style,
+      use_native_types,
   ):
+    dtype = jnp.int4 if use_native_types and precision == 4 else jnp.int8
     quantization_option = QuantizationParams(
-        quantization_type=QuantizationType.PTQ,
+        quantization_type=quantization_type,
         mode=QuantizationMode.INFERENCE,
-        weight_params=WeightQuantizationParams(use_symmetric=use_symmetric),
+        weight_params=WeightQuantizationParams(
+            precision=precision,
+            use_symmetric=use_symmetric,
+            use_int4_packed_weights=not use_native_types,
+            dtype=dtype,
+            int4_packed_weights_container_dtype=jnp.int8,
+        ),
     )
     f_p = pax_fiddle.Config(
         embedding_softmax.SharedEmbeddingSoftmax,
@@ -305,6 +321,11 @@ class SharedEmbeddingSoftmaxTest(test_utils.TestCase):
           else self.QUANTIZED_WEIGHTS_ASYMMETRIC,
           dtype=np.int8,
       )
+      if precision == 4:
+        if use_native_types:
+          q_linear_params['w'] = jnp.array(q_linear_params['w'], dtype)
+        else:
+          q_linear_params['w'] = utils.pack_4bit(q_linear_params['w'], 0, dtype)
       q_linear_params['w_quantized_scale'] = np.array(
           self.SCALES_SYMMETRIC if use_symmetric else self.SCALES_ASYMMETRIC,
           dtype=q_p.dtype,
@@ -333,8 +354,11 @@ class SharedEmbeddingSoftmaxTest(test_utils.TestCase):
       f_lookup = f_layer.apply(
           f_initial_vars, class_ids, method=f_layer.emb_lookup
       )
-      self.assertAllClose(q_logits, f_logits, rtol=5e-1, atol=5e-2)
-      self.assertAllClose(q_lookup, f_lookup, rtol=1e-2, atol=1e-2)
+      self.assertEqual(q_logits.shape, f_logits.shape)
+      self.assertEqual(q_lookup.shape, f_lookup.shape)
+      if precision == 8:
+        self.assertAllClose(q_logits, f_logits, rtol=5e-1, atol=5e-2)
+        self.assertAllClose(q_lookup, f_lookup, rtol=1e-2, atol=1e-2)
 
 
 class NClassMajorSharedEmbeddingSoftmaxTest(test_utils.TestCase):

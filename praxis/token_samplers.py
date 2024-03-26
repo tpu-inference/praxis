@@ -20,7 +20,7 @@ top_p.
 """
 
 import abc
-from typing import Sequence
+from typing import Any, Sequence
 
 import jax
 from jax import numpy as jnp
@@ -100,8 +100,8 @@ def get_top_k(
   Args:
     logits: Logits of current step. This is a JTensor of [batch_size *
       num_samples, vocab_size].
-    top_k: Only selecting among the most likely k tokens at each step. top_k is
-      set to the maximum k value for sampling decode.
+    top_k: If non zero, only selecting among the most likely k tokens at each
+      step. top_k is set to the maximum k value for sampling decode.
     per_example_top_k: Optional per example top_k of shape [batch_size *
       num_samples]. The value of per_example_top_k should be smaller or equal to
       `top_k` and larger than 0.
@@ -113,6 +113,12 @@ def get_top_k(
     A tuple of top_k_logits of shape [batch_size * num_samples, top_k] and
       top_k_indices of shape [batch_size * num_samples, top_k].
   """
+  if not top_k:
+    # Select all indices.
+    indices = jnp.arange(logits.shape[-1])
+    indices = jnp.reshape(indices, (1,) * (logits.ndim - 1) + (len(indices),))
+    indices = jnp.tile(indices, logits.shape[:-1] + (1,))
+    return logits, indices
   # TopK of shape [batch_size * num_samples, top_k]
   if top_k_recall_target < 1.0:
     assert top_k_recall_target > 0.0
@@ -565,6 +571,13 @@ class BaseNextTokenSampler(
   ) -> NestedMap:
     """Delete unused decode loop state."""
     return decode_loop_state
+
+  @classmethod
+  def get_extra_kwargs(
+      cls, inputs: NestedMap, num_samples: int
+  ) -> dict[str, Any]:
+    """Gets the supported extra arguments from model inputs."""
+    return {}
 
   def _get_prng_key(
       self,

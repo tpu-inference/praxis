@@ -21,6 +21,7 @@ import zlib
 
 from absl import flags
 from absl.testing import parameterized
+from etils import epath
 import jax
 from jax import numpy as jnp
 import numpy as np
@@ -64,6 +65,10 @@ class TestCase(parameterized.TestCase):
       err: A float value.
       msg: An optional string message to append to the failure message.
     """
+    if isinstance(f1, jax.Array):
+      f1 = float(f1.item())
+    if isinstance(f2, jax.Array):
+      f2 = float(f2.item())
     # f1 == f2 is needed here as we might have: f1, f2 = inf, inf
     self.assertTrue(
         f1 == f2 or math.fabs(f1 - f2) <= err,
@@ -518,7 +523,7 @@ def replace_jax_conformer_layer_vars_to_tf(
   return tf_initial_vars
 
 
-def get_tfevent_log_dirs(root: str) -> list[str]:
+def get_tfevent_log_dirs(root: epath.PathLike) -> list[str]:
   """Return list of log dirs relative to `root` that contain tfevent files."""
   log_dir_names = []
   for dirname, subdir, fnames in tf.io.gfile.walk(root):

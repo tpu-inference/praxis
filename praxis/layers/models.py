@@ -431,6 +431,7 @@ class LanguageModel(base_model.BaseModel):
 
     if (
         template_has_type(decoder_params, SampleDecoderHParams)
+        and hasattr(decoder_params, 'cf_guidance_scale')
         and decoder_params.cf_guidance_scale is not None
     ):
       decode_data = self._prepare_guidance_decode_data(decode_data)
@@ -642,7 +643,12 @@ class LanguageModel(base_model.BaseModel):
         next_token_sampler_p.use_top_k_for_logprobs = (
             decoder_params.use_top_k_for_logprobs
         )
-      next_token_sampler = base_layer.instantiate(next_token_sampler_p)
+      next_token_sampler = base_layer.instantiate(
+          next_token_sampler_p,
+          **next_token_sampler_p.cls.get_extra_kwargs(
+              input_batch, decoder_params.num_samples
+          ),
+      )
 
       if decoder_params.vanilla_sample_decode:
         # TODO(b/289423925): All decoders should remove the last id. Currently,
@@ -906,6 +912,264 @@ class LanguageModel(base_model.BaseModel):
     return metrics, ret, out_clu_metrics
 
 
+# TODO(@jwyang): add support for sample decoding and beam search
+class LanguageModelContinuousBatching(LanguageModel):
+  """Language model that uses continuous batching."""
+
+  def _last_decode_step(self, decoder_params) -> int:
+    max_decode_steps = decoder_params.max_decode_steps
+    if isinstance(decoder_params.max_decode_steps, int):
+      max_decode_steps = [decoder_params.max_decode_steps]
+    max_decode_steps = sorted(max_decode_steps)
+    return max(max_decode_steps)
+
+  def sample_init_decode_state(
+      self, decode_data: NestedMap, decoder_params: DecoderHParams
+  ) -> NestedMap:
+    max_prefix_len = decoder_params.seqlen - decoder_params.max_decode_steps
+
+    def transform_decode_state_fn(mdl, transform_fn):
+      mdl.transform_decode_state(transform_fn)
+
+    decode_state = sample_decode.sample_init_decode_state(
+        model=self.lm,
+        prefix_ids=decode_data.input_ids,
+        max_prefix_len=max_prefix_len,
+        max_decode_steps=self._last_decode_step(decoder_params),
+        top_k=getattr(decoder_params, 'k', 1),
+        top_p=getattr(decoder_params, 'p', None),
+        prefix_lengths=decode_data.prefix_lengths,
+        eos_id=decoder_params.eos_id,
+        transform_state_fn=transform_decode_state_fn,
+    )
+    return decode_state
+
+  def sample_prefill(
+      self,
+      input_batch: NestedMap,
+      decoder_params: DecoderHParams,
+  ) -> NestedMap:
+    if decoder_params.seqlen <= 0:
+      raise ValueError(
+          'Must set p.decoder_tpl.seqlen > 0, current value = '
+          f'{decoder_params.seqlen}'
+      )
+    decode_data = self._prepare_decode_data(input_batch, decoder_params)
+
+    # run prefill
+    def fprop_fn(mdl, ids, paddings):
+      del ids, paddings
+      output = mdl(
+          decode_data.fprop_input_ids,
+          decode_data.fprop_input_paddings,
+          segment_ids=decode_data.fprop_segment_ids,
+          segment_pos=decode_data.fprop_segment_pos,
+          start_time_step=decode_data.start_time_step,
+          causal_attention_mask=decode_data.causal_attention_mask,
+          **decode_data.extra_input_kwargs,
+      )
+      return output.logits
+
+    logits = fprop_fn(
+        self.lm, decode_data.input_ids, decode_data.input_paddings
+    )
+    last_prefix_logits = logits[:, -1, :]
+
+    # init prefix decode state
+    prefill_decode_state = self.sample_init_decode_state(
+        decode_data, decoder_params
+    )
+
+    batch_size = input_batch.ids.shape[0]
+    logging.info('Prefill batch_size is %s', batch_size)
+    # Fetch dynamic per params from input_batch if the
+    # input_batch has this information.
+    last_decode_step = self._last_decode_step(decoder_params)
+    temperature = getattr(decoder_params, 'temperature', 0.0)
+    prefill_decode_state.temperature = getattr(
+        input_batch,
+        'temperature',
+        jnp.ones(shape=(batch_size,), dtype=jnp.float32) * temperature,
+    )
+    prefill_decode_state.per_example_max_decode_steps = getattr(
+        input_batch,
+        'per_example_max_decode_steps',
+        jnp.ones(shape=(batch_size,), dtype=jnp.int32) * last_decode_step,
+    )
+    prefill_decode_state.per_example_top_p = getattr(
+        input_batch,
+        'per_example_top_p',
+        jnp.ones(shape=(batch_size,), dtype=jnp.float32),
+    )
+    prefill_decode_state.per_example_top_k = getattr(
+        input_batch,
+        'per_example_top_k',
+        jnp.ones(shape=(batch_size,), dtype=jnp.int32),
+    )
+
+    def extend_step_fn(mdl, ids, segment_pos):
+      del mdl, ids, segment_pos
+      return last_prefix_logits
+
+    last_decode_steps = self._last_decode_step(decoder_params)
+    max_prefix_len = decoder_params.seqlen - last_decode_steps
+
+    prefill_decode_state = sample_decode.sample_decoding_step(
+        model=self.lm,
+        extend_step_fn=extend_step_fn,
+        decode_state=prefill_decode_state,
+        max_prefix_len=max_prefix_len,
+        eos_id=decoder_params.eos_id,
+        decode_loop_mesh_axes_transpose=decoder_params.decode_loop_mesh_axes_transpose,
+        max_decode_steps=decoder_params.max_decode_steps,
+    )
+    return prefill_decode_state
+
+  def sample_insert(
+      self,
+      decoder_params,
+      prefix_decode_state,
+      prefix_decode_cache,
+      decode_state,
+      prefix_slot,
+      slot,
+  ):
+    # update decode_state
+    decode_state.per_sample_steps = decode_state.per_sample_steps.at[slot].set(
+        prefix_decode_state.per_sample_steps[prefix_slot]
+    )
+
+    # set 0 to start decoding phase
+    decode_state.done = decode_state.done.at[slot].set(0)
+
+    attrs = [
+        'has_eos',
+        'prefix_lengths',
+        'segment_pos',
+        'decode_lengths',
+        'output_ids',
+        'logprobs',
+        'temperature',
+        'per_example_max_decode_steps',
+        'per_example_top_p',
+        'per_example_top_k',
+    ]
+
+    for attr in attrs:
+      update = getattr(prefix_decode_state, attr)
+      update = update[prefix_slot]
+      state_dtype = getattr(decode_state, attr).dtype
+      if state_dtype != update.dtype:
+        logging.info(
+            '%s changed from %s to %s:', attr, state_dtype, update.dtype
+        )
+        update = update.astype(state_dtype)
+
+      if update.ndim == 0:
+        update = jnp.expand_dims(update, axis=0)
+      ret = jax.lax.dynamic_update_slice_in_dim(
+          getattr(decode_state, attr), update, slot, axis=0
+      )
+      setattr(decode_state, attr, ret)
+
+    # update kv_cache (need to right aligned)
+    max_prefix_len = decoder_params.seqlen - decoder_params.max_decode_steps
+    sequence_len = decoder_params.seqlen
+
+    right_aligned_length = sequence_len - (decode_state.step - max_prefix_len)
+    for i in range(self.lm_tpl.stacked_transformer_tpl.num_layers):
+      layer_kv_cache_key = 'x_layers_{}'.format(i)
+      per_layer_prefix_decode_cache = prefix_decode_cache['decoder_cache'][
+          'lm'
+      ]['transformer'][layer_kv_cache_key]['self_attention']
+      atten_state = self.variables[base_layer.DECODE_CACHE]['lm'][
+          'transformer'
+      ][layer_kv_cache_key]['self_attention']
+
+      for name in atten_state.keys():
+        new_state = per_layer_prefix_decode_cache[name][prefix_slot]
+        new_state = jnp.expand_dims(new_state, axis=0)
+        atten_state[name] = jax.lax.dynamic_update_slice_in_dim(
+            atten_state[name],
+            decoder_utils.right_align_tensors(new_state, right_aligned_length),
+            slot,
+            axis=0,
+        )
+
+    return decode_state
+
+  def left_align_decode_state(
+      self, max_prefix_len, max_decode_steps, decode_state, batch_size
+  ):
+    # when reach end of sequence, align all tensors to left end, reset step
+    decode_state.per_sample_steps = jnp.where(
+        decode_state.done, max_prefix_len, decode_state.per_sample_steps
+    )
+    left_align_steps = jnp.max(decode_state.per_sample_steps)
+    left_align_steps_arr = (
+        jnp.ones_like(decode_state.prefix_lengths) * left_align_steps
+    )
+
+    row_length = max_prefix_len + max_decode_steps
+
+    transformer_kv_cache = self.variables[base_layer.DECODE_CACHE]['lm'][
+        'transformer'
+    ]
+    for i in range(self.lm_tpl.stacked_transformer_tpl.num_layers):
+      layer_kv_cache_key = 'x_layers_{}'.format(i)
+      atten_kv = transformer_kv_cache[layer_kv_cache_key]['self_attention']
+      for name in atten_kv.keys():
+        atten_kv[name] = decoder_utils.left_align_kv_cache(
+            atten_kv[name],
+            left_align_steps_arr,
+            row_length - 1,
+            batch_size=batch_size,
+        )
+
+    decode_state.step = jnp.where(
+        decode_state.step < row_length - 1, decode_state.step, left_align_steps
+    )
+    self.variables[base_layer.DECODE_CACHE]['lm']['time_step'] = (
+        decode_state.step[0]
+    )
+
+    return decode_state
+
+  def sample_generate(
+      self,
+      decode_state: NestedMap,
+      decoder_params: DecoderHParams,
+      align_decode_state: bool = False,
+  ) -> NestedMap:
+    def extend_step_fn(mdl, ids, segment_pos):
+      xent = mdl.extend_step(ids, segment_pos=segment_pos)
+      return xent.logits
+
+    model = self.lm
+    decode_mesh_transpose = decoder_params.decode_loop_mesh_axes_transpose
+    last_decode_steps = self._last_decode_step(decoder_params)
+
+    max_prefix_len = decoder_params.seqlen - last_decode_steps
+    if align_decode_state:
+      decode_state = self.left_align_decode_state(
+          max_prefix_len,
+          last_decode_steps,
+          decode_state,
+          decoder_params.num_cache_slots,
+      )
+
+    decode_state = sample_decode.sample_decoding_step(
+        model=model,
+        extend_step_fn=extend_step_fn,
+        decode_state=decode_state,
+        max_prefix_len=max_prefix_len,
+        eos_id=decoder_params.eos_id,
+        decode_loop_mesh_axes_transpose=decode_mesh_transpose,
+        max_decode_steps=decoder_params.max_decode_steps,
+    )
+    return decode_state
+
+
 @dataclasses.dataclass(kw_only=True, slots=True)
 class Labels:
   class_ids: Int32[ArrayT, 'B T']
@@ -1063,9 +1327,11 @@ class LanguageModelDPO(base_model.BaseModel):
       assert len(softmax_out.per_sequence_xent.shape) == 1
       return -1.0 * softmax_out.per_sequence_xent
 
-    y_w_ref_log_p = per_seq_log_p(predictions.y_w_ref)
+    # Prevent backprop into reference model
+    y_w_ref_log_p = jax.lax.stop_gradient(per_seq_log_p(predictions.y_w_ref))
+    y_l_ref_log_p = jax.lax.stop_gradient(per_seq_log_p(predictions.y_l_ref))
+    # Allow backprop into policy model
     y_w_pi_log_p = per_seq_log_p(predictions.y_w_pi)
-    y_l_ref_log_p = per_seq_log_p(predictions.y_l_ref)
     y_l_pi_log_p = per_seq_log_p(predictions.y_l_pi)
 
     self.add_summary('dpo/y_w_ref_log_p', jnp.mean(y_w_ref_log_p))
@@ -1077,22 +1343,11 @@ class LanguageModelDPO(base_model.BaseModel):
     add_hist(self, 'dpo/y_l_ref_log_p', y_l_ref_log_p)
     add_hist(self, 'dpo/y_l_pi_log_p', y_l_pi_log_p)
 
-    r_hat_y_w = jax.lax.stop_gradient(
-        self.beta * (y_w_pi_log_p - y_w_ref_log_p)
-    )
-    r_hat_y_l = jax.lax.stop_gradient(
-        self.beta * (y_l_pi_log_p - y_l_ref_log_p)
-    )
+    r_hat_y_w = self.beta * (y_w_pi_log_p - y_w_ref_log_p)
+    r_hat_y_l = self.beta * (y_l_pi_log_p - y_l_ref_log_p)
 
-    # This is first equation on page #5 in the DPO paper.
-    per_example_loss = (
-        self.beta
-        * jax.nn.sigmoid(r_hat_y_l - r_hat_y_w)
-        * (y_l_pi_log_p - y_w_pi_log_p)
-    )
-    loss = jnp.mean(per_example_loss)
     # This is the dpo_loss, same as what equation 7 in the paper computes.
-    dpo_loss = jnp.mean(-1.0 * jnp.log(jax.nn.sigmoid(r_hat_y_w - r_hat_y_l)))
+    loss = -1.0 * jnp.mean(jax.nn.log_sigmoid(r_hat_y_w - r_hat_y_l))
 
     self.add_summary('dpo/r_hat_y_w', jnp.mean(r_hat_y_w))
     self.add_summary('dpo/r_hat_y_w_std', jnp.std(r_hat_y_w))
@@ -1100,7 +1355,7 @@ class LanguageModelDPO(base_model.BaseModel):
     self.add_summary('dpo/r_hat_y_l_std', jnp.std(r_hat_y_l))
     self.add_summary('dpo/delta_r_hat', jnp.mean(r_hat_y_w - r_hat_y_l))
     self.add_summary('dpo/delta_r_hat_std', jnp.std(r_hat_y_w - r_hat_y_l))
-    self.add_summary('dpo/dpo_loss', dpo_loss)
+    self.add_summary('dpo/dpo_loss', loss)
     self.add_summary(
         '_dpo_topline/p_correct_ranking',
         jnp.mean(jax.nn.sigmoid(r_hat_y_w - r_hat_y_l)),
@@ -1112,11 +1367,9 @@ class LanguageModelDPO(base_model.BaseModel):
     batch_size = predictions.y_l_ref.per_example_xent.shape[0]
 
     # TODO(yonghui): Add diagnostic summaries.
-    # pair_loss is what learning back-props into.
     return (
         NestedMap(
             total_loss=(loss, jnp.array(batch_size, loss.dtype)),
-            dpo_loss=(dpo_loss, jnp.array(batch_size, dpo_loss.dtype)),
         ),
         {},
     )
@@ -1310,6 +1563,9 @@ class SequenceModel(base_model.BaseModel):
       )
       next_token_sampler = base_layer.instantiate(next_token_sampler_p)
 
+      prefix_lengths = None
+      if 'prefix_lengths' in input_batch:
+        prefix_lengths = input_batch.prefix_lengths
       result = sample_decode.sample_decode(
           self,
           extend_step_fn,
@@ -1318,6 +1574,7 @@ class SequenceModel(base_model.BaseModel):
           next_token_sampler=next_token_sampler,
           prefix_ids=input_batch.tgt.ids,
           prefix_paddings=input_batch.tgt.paddings,
+          prefix_lengths=prefix_lengths,
           seq_len=decoder_params.seqlen,
           fprop_fn=fprop_fn,
           num_samples=decoder_params.num_samples,
@@ -1348,12 +1605,16 @@ class SequenceModel(base_model.BaseModel):
             ),
         )
 
+      prefix_lengths = None
+      if 'prefix_lengths' in input_batch:
+        prefix_lengths = input_batch.prefix_lengths
       result = sample_decode.greedy_decode(
           self,
           extend_step_fn,
           input_batch.tgt.ids,
           input_batch.tgt.paddings,
           decoder_params.seqlen,
+          prefix_lengths=prefix_lengths,
           eos_id=decoder_params.eos_id,
           fprop_fn=fprop_fn,
           transform_state_fn=transform_decode_state_fn,

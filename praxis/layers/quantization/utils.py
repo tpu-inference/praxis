@@ -15,7 +15,7 @@
 
 """Utilities for quantization."""
 
-from typing import Sequence, Type
+from typing import List, Sequence, Type
 
 import fiddle as fdl
 from jax import lax
@@ -25,6 +25,18 @@ from praxis import pax_fiddle
 
 
 JTensor = jnp.ndarray
+
+INT4_TYPES = [jnp.int4, jnp.uint4]
+INT_TYPES = [
+    jnp.int4,
+    jnp.uint4,
+    jnp.int8,
+    jnp.uint8,
+    jnp.int16,
+    jnp.uint16,
+    jnp.int32,
+    jnp.uint32,
+]
 
 
 def einsum_eqn_to_dimension_numbers(
@@ -78,10 +90,11 @@ def einsum_eqn_to_dimension_numbers(
         'Contraction dims must be present in both lhs and rhs, but got '
         f'{lhs_contraction_names} and {rhs_contraction_names}'
     )
-  contraction_names = lhs_contraction_names
+  # The order of the contraction dims does not matter to dot_general so long as
+  # it is the same for both arguments, but ensuring that the order is
+  # deterministic allows for easier validation of exported model artifacts.
+  contraction_names = sorted(lhs_contraction_names)
 
-  # The order of the contraction dims does not matter so long as it is the same
-  # for both arguments.
   lhs_contraction_dims = [lhs_names.index(name) for name in contraction_names]
   rhs_contraction_dims = [rhs_names.index(name) for name in contraction_names]
   dimension_numbers = (
@@ -171,7 +184,7 @@ def pack_4bit(
 def unpack_4bit(
     packed: JTensor, pack_dim: int, original_dtype: jnp.dtype
 ) -> JTensor:
-  """Unpack int32/int8 tensor packed by pack_4bit() to int32/int8 tensor.
+  """Unpack int32/int8 tensor packed by pack_4bit() to uint8/int8 tensor.
 
   Args:
     packed: int32 or int8 tensor that was packed by pack_4bit() function.
@@ -181,11 +194,11 @@ def unpack_4bit(
       function. Must be either int8 or uint8.
 
   Returns:
-    int32/int8 unpack tensor where the pack_dim size is multiplied by 8/2 from
+    uint8/int8 unpack tensor where the pack_dim size is multiplied by 8/2 from
     the packed tensor. Which means that the returned shape is identical to the
     original shape before pack_4bit().
-    Note that original input to pack_4bit() is int8 or uint8, but the unpacked
-    tensor returned by unpack_4bit() is int32/int8 with same values
+    Note that original input to pack_4bit() is int8 or uint8, so the unpacked
+    tensor returned by unpack_4bit() is uint8/int8 with same values
     and shape of the original tensor.
   """
   if packed.dtype != jnp.int32 and packed.dtype != jnp.int8:
@@ -223,11 +236,64 @@ def unpack_4bit(
     # Arithmetic shift is required to repsect negative numbers
     return lax.shift_right_arithmetic(
         rep, jnp.array(packet_type_bits - 4, packed.dtype)
-    )
+    ).astype(original_dtype)
   else:
     return lax.shift_right_logical(
         rep, jnp.array(packet_type_bits - 4, packed.dtype)
-    )
+    ).astype(original_dtype)
+
+
+def dtype_to_bits(dtype: jnp.dtype) -> int:
+  dtype = jnp.dtype(dtype) if not isinstance(dtype, jnp.dtype) else dtype
+  # dtype.itemsize does not reflect int4 being smaller than int8.
+  return 4 if dtype in INT4_TYPES else dtype.itemsize * 8
+
+
+def bits_to_dtype(bits: int, signed: bool = True) -> jnp.dtype:
+  """Returns the smallest int dtype that can represent a specific precision."""
+  assert 1 <= bits <= 32, f'{bits=} must be between 1 and 32'
+  if bits <= 4:
+    return jnp.int4 if signed else jnp.uint4
+  elif bits <= 8:
+    return jnp.int8 if signed else jnp.uint8
+  elif bits <= 16:
+    return jnp.int16 if signed else jnp.uint16
+  else:
+    return jnp.int32 if signed else jnp.uint32
+
+
+def get_smallest_matching_dtype(lhs: JTensor, rhs: JTensor) -> jnp.dtype:
+  """Returns the smallest integer dtype that can represent both lhs and rhs."""
+  if lhs.dtype not in INT_TYPES:
+    raise ValueError(f'{lhs.dtype=} is not an int type: {INT_TYPES} ')
+  if rhs.dtype not in INT_TYPES:
+    raise ValueError(f'{rhs.dtype=} is not an int type: {INT_TYPES} ')
+
+  lhs_signed = jnp.issubdtype(lhs.dtype, jnp.signedinteger)
+  rhs_signed = jnp.issubdtype(rhs.dtype, jnp.signedinteger)
+
+  if (lhs_signed and rhs_signed) or (not lhs_signed and not rhs_signed):
+    # If the signedness matches, simply use the larger dtype.
+    lhs_bits = dtype_to_bits(lhs.dtype)
+    rhs_bits = dtype_to_bits(rhs.dtype)
+    return lhs.dtype if lhs_bits >= rhs_bits else rhs.dtype
+  else:
+    signed = rhs if rhs_signed else lhs
+    unsigned = lhs if rhs_signed else rhs
+    signed_bits = dtype_to_bits(signed.dtype)
+    unsigned_bits = dtype_to_bits(unsigned.dtype)
+    if unsigned_bits < signed_bits:
+      # If the unsigned dtype is smaller, it fits in the larger signed dtype.
+      return signed.dtype
+    else:
+      # If the unsigned dtype is as big or larger than the signed dtype, then
+      # represent both with the next largest signed dtype.
+      if unsigned_bits < 32:
+        return bits_to_dtype(unsigned_bits * 2, signed=True)
+      else:
+        # Since i64 support is usually disabled, just match XLA's behavior of
+        # truncating ui32 to i32.
+        return jnp.int32
 
 
 def get_packed_shape(shape: Sequence[int], pack_dim: int, packing_factor: int):
@@ -255,3 +321,198 @@ def find_target_tpl(
     ):
       target_tpl.append(node)
   return target_tpl
+
+
+def get_lora_shape_and_eqn(
+    shape: Sequence[int], lora_size: int, eqn: str, max_reduction=True
+) -> tuple[str, str, List[int], List[int], List[int], List[int]]:
+  """Gets equations and shapes for LoRA weights of einsum equation.
+
+  Args:
+    shape: Weight shape.
+    lora_size: Size of LoRA dimension.
+    eqn: Einsum equation.
+    max_reduction: It is used only for a case when there are two reduction dims.
+      If True, then max reduction dim will be used as LoRA dim, else it will use
+      both dims for two LoRA dims.
+
+  Returns:
+    Einsum equation for w_left.
+    Einsum equation for w_right.
+    Weight shape for w_left.
+    Weight shape for w_right.
+    Index of LoRA dim in w_left.
+    Index of LoRA dim in w_right.
+  """
+  # Below comments are for example of eqn='...y,yz->...z'.
+  eqn_split = eqn.split('->')
+  assert len(eqn_split) == 2
+  left_right = eqn_split[0]  # '...y,yz'
+  left_right = left_right.split(',')
+  assert len(left_right) == 2
+  left, right = left_right[0], left_right[1]  # ('...y', 'yz')
+
+  def map_str2ind(eqn_part):
+    ch_map = {}
+    ind = 0
+    for ch in eqn_part:
+      if ch != '.':
+        ch_map[ch] = ind
+        ind += 1
+    return ch_map
+
+  left_map = map_str2ind(left)
+  right_map = map_str2ind(right)
+
+  # Find unique character which is not part of eqn.
+  lora_ch1 = None
+  lora_ch2 = None
+  for x in range(97, 123):
+    ch = chr(x)
+    if ch not in left_map and ch not in right_map:
+      if lora_ch1 is None:
+        lora_ch1 = ch
+      elif lora_ch2 is None:
+        lora_ch2 = ch
+      else:
+        break
+  assert lora_ch1 is not None
+  assert lora_ch2 is not None
+
+  # Select reduction dimension.
+  ch_reductions = []
+  ch_reduction2 = None
+  for ch in left_map:
+    if ch in right_map:
+      ch_reductions.append(ch)
+  assert ch_reductions
+  if len(ch_reductions) == 1:
+    ch_reduction1 = ch_reductions[0]
+  elif len(ch_reductions) == 2:
+    # If there are several reduction dimensions then select the largest one
+    # as LoRA dim.
+    if max_reduction:
+      max_reduction_size = 0
+      for ch in ch_reductions:
+        eqn_right_ind = right_map[ch]
+        eqn_right_size = shape[eqn_right_ind]
+        if max_reduction_size < eqn_right_size:
+          max_reduction_size = eqn_right_size
+          ch_reduction1 = ch
+    else:
+      ch_reduction1 = ch_reductions[0]
+      ch_reduction2 = ch_reductions[1]
+  else:
+    raise ValueError(
+        f'Unsupported number of reduction dims: {len(ch_reductions)}'
+    )
+
+  offset = 0
+  if len(left) >= 3:
+    if left[:3] == '...':
+      offset = 3
+
+  if ch_reduction2 is None:
+    # Equation for w_left
+    eqn_left_ind1 = left_map[ch_reduction1]
+    new_right = [ch_reduction1, lora_ch1]
+    new_left = list(left)
+    new_left[eqn_left_ind1 + offset] = lora_ch1
+    new_eqn_left = list(left) + [','] + new_right + ['->'] + new_left
+    new_eqn_left = ''.join(new_eqn_left)
+
+    # Equation for w_right
+    new_right = list(right)
+    eqn_right_ind1 = right_map[ch_reduction1]
+    assert new_right[0] != '.'
+    new_right[eqn_right_ind1] = lora_ch1
+    new_eqn_right = new_left + [','] + new_right + ['->'] + list(eqn_split[1])
+    new_eqn_right = ''.join(new_eqn_right)
+
+    # Shapes for w_left and w_right
+    left_shape = [shape[eqn_right_ind1], lora_size]
+    right_shape = list(shape)
+    right_shape[eqn_right_ind1] = lora_size
+    return (
+        new_eqn_left,
+        new_eqn_right,
+        left_shape,
+        right_shape,
+        [1],
+        [eqn_right_ind1],
+    )
+  else:
+    # Equation for w_left
+    eqn_left_ind1 = left_map[ch_reduction1]
+    eqn_left_ind2 = left_map[ch_reduction2]
+    new_right = [ch_reduction1, ch_reduction2, lora_ch1, lora_ch2]
+    new_left = list(left)
+    new_left[eqn_left_ind1 + offset] = lora_ch1
+    new_left[eqn_left_ind2 + offset] = lora_ch2
+    new_eqn_left = list(left) + [','] + new_right + ['->'] + new_left
+    new_eqn_left = ''.join(new_eqn_left)
+
+    # Equation for w_right
+    new_right = list(right)
+    eqn_right_ind1 = right_map[ch_reduction1]
+    eqn_right_ind2 = right_map[ch_reduction2]
+    assert new_right[0] != '.'
+    new_right[eqn_right_ind1] = lora_ch1
+    new_right[eqn_right_ind2] = lora_ch2
+    new_eqn_right = new_left + [','] + new_right + ['->'] + list(eqn_split[1])
+    new_eqn_right = ''.join(new_eqn_right)
+
+    # Shapes for w_left and w_right
+    left_shape = [
+        shape[eqn_right_ind1],
+        shape[eqn_right_ind2],
+        lora_size,
+        lora_size,
+    ]
+    right_shape = list(shape)
+    right_shape[eqn_right_ind1] = lora_size
+    right_shape[eqn_right_ind2] = lora_size
+    return (
+        new_eqn_left,
+        new_eqn_right,
+        left_shape,
+        right_shape,
+        [2, 3],
+        [eqn_right_ind1, eqn_right_ind2],
+    )
+
+
+def get_left_weight_split_dims_mapping(
+    weight_split_dims_mapping: tuple[str | None, ...] | None,
+    eqn_left_ind: List[int],
+) -> tuple[str | None, ...] | None:
+  if weight_split_dims_mapping is None:
+    return None
+  else:
+    if len(eqn_left_ind) == 1:
+      return (weight_split_dims_mapping[0], None)
+    elif len(eqn_left_ind) == 2:
+      return (
+          weight_split_dims_mapping[0],
+          weight_split_dims_mapping[1],
+          None,
+          None,
+      )
+    else:
+      raise ValueError(
+          f'Usupported number of reduction dims {len(eqn_left_ind)}'
+      )
+
+
+def get_right_weight_split_dims_mapping(
+    weight_split_dims_mapping: tuple[str | None, ...] | None,
+    eqn_right_ind: List[int],
+) -> tuple[str | None, ...] | None:
+
+  if weight_split_dims_mapping is None:
+    return None
+  else:
+    out_weight_split_dims_mapping = list(weight_split_dims_mapping)
+    for ind in eqn_right_ind:
+      out_weight_split_dims_mapping[ind] = None
+    return tuple(out_weight_split_dims_mapping)

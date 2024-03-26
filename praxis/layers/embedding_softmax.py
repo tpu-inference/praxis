@@ -14,9 +14,10 @@
 # limitations under the License.
 
 """Embedding and softmax layers."""
-
 import math
+from typing import Optional
 
+from flax import linen as nn
 import jax
 from jax import numpy as jnp
 import numpy as np
@@ -26,6 +27,7 @@ from praxis import py_utils
 from praxis import pytypes
 from praxis.layers import activations
 from praxis.layers import base_ops
+from praxis.layers import chunk
 from praxis.layers import linears
 
 NestedMap = py_utils.NestedMap
@@ -37,6 +39,7 @@ SplitDimsMapping = pytypes.SplitDimsMapping
 LayerTpl = pax_fiddle.Config[base_layer.BaseLayer]
 
 template_field = base_layer.template_field
+instance_field = base_layer.instance_field
 
 
 def _compute_z_loss(logits):
@@ -111,8 +114,8 @@ class Embedding(base_layer.BaseLayer):
   lookup_style: str = 'index'
   scale_sqrt_depth: bool = False
   set_nan_for_oob_id: bool = False
-  array_lookup_tpl: LayerTpl = template_field(base_ops.ArrayLookup)
-  einsum_tpl: LayerTpl = template_field(base_ops.EinsumOp)
+  array_lookup: base_ops.ArrayLookup = instance_field(base_ops.ArrayLookup)
+  einsum: base_ops.EinsumOp = instance_field(base_ops.EinsumOp)
 
   class ActivationSharding(base_layer.BaseLayer.ActivationSharding):
     """Represents how intermediate values should be partitioned across a mesh.
@@ -136,8 +139,6 @@ class Embedding(base_layer.BaseLayer):
             tensor_split_dims_mapping=wp.wt,
         ),
     )
-    self.create_child('array_lookup', self.array_lookup_tpl.clone())
-    self.create_child('einsum', self.einsum_tpl.clone())
 
   def __call__(self, ids: JTensor) -> JTensor:
     return self.emb_lookup(ids)
@@ -194,6 +195,9 @@ class FullSoftmax(base_layer.BaseLayer):
       None, skip feedforward layer and directly apply softmax to the input.
     scale_before_logits: If set True, activations are scaled with 1/sqrt(M)
       before computing the logits
+    chunk_size: chunk size of sequence axis. If set, lax.scan computes softmax
+      chunkwise to save HBM. If set, it doesn't return logits and log_probs. 256
+      is a compromise between performance and memory usage.
   """
 
   input_dims: int = 0
@@ -206,6 +210,7 @@ class FullSoftmax(base_layer.BaseLayer):
   bias_init: float | None = 0.0
   feed_forward_tpl: LayerTpl = template_field(linears.FeedForward)
   scale_before_logits: bool = False
+  chunk_size: int | None = None
 
   def setup(self) -> None:
     if self.feed_forward_tpl is not None:
@@ -293,8 +298,93 @@ class FullSoftmax(base_layer.BaseLayer):
     if class_ids is None and class_probabilities is None:
       raise ValueError('One of class_ids or class_probabilities must be given.')
 
+    chunk_size = self.chunk_size or 0
+    use_full_softmax = (
+        (chunk_size == 0)
+        # The scan optimization is not meaningful, as class_probabilities
+        # already allocates full HBM.
+        | (class_probabilities is not None)
+        # Don't use vmap optimization for small inputs.
+        | (inputs.ndim != 3)
+        | (inputs.shape[1] < chunk_size)
+        # TODO(pax-dev): support scan for z_loss_weight if needed.
+        | (self.z_loss_weight > 0.0)
+    )
+    if use_full_softmax:
+      per_example_xent, per_example_argmax, logits, log_probs = (
+          self._compute_xent(inputs, class_ids, class_probabilities)
+      )
+    else:
+      per_example_xent, per_example_argmax = self._compute_xent_scan(
+          inputs, class_ids
+      )
+      logits = log_probs = None
+
+    # Compute total softmax cross-entropy loss for the output tensor.
+    total_xent = jnp.sum(
+        jnp.expand_dims(per_example_xent, axis=-1) * class_weights,
+        dtype=jnp.float32,
+    )
+    total_weight = jnp.sum(class_weights, dtype=jnp.float32)
+
+    if self.z_loss_weight > 0.0:
+      assert logits is not None
+      z_loss = (
+          jnp.sum(_compute_z_loss(logits) * class_weights, dtype=jnp.float32)
+          / total_weight
+      )
+      z_loss *= self.z_loss_weight
+      self.add_summary('aux_z_loss', z_loss)
+      self.add_aux_loss('aux_z_loss', z_loss)
+
+    if logits is not None:
+      logits = logits.astype(inputs.dtype)
+      log_probs = log_probs.astype(inputs.dtype)
+
+    output_nmap = NestedMap(
+        logits=logits,
+        log_probs=log_probs,
+        per_example_argmax=per_example_argmax,
+        per_example_xent=per_example_xent.astype(jnp.float32),
+        total_xent=total_xent,
+        total_weight=total_weight,
+        avg_xent=(total_xent / (total_weight + 1e-6)).astype(jnp.float32),
+    )
+    if class_ids is not None:
+      output_nmap.accuracy = (
+          jnp.sum(
+              (per_example_argmax[..., jnp.newaxis] == class_ids)
+              * class_weights
+          )
+          / total_weight
+      )
+    if self.z_loss_weight > 0.0:
+      output_nmap['z_loss'] = z_loss
+    return output_nmap
+
+  @nn.nowrap
+  def _compute_xent(
+      self,
+      inputs: JTensor,
+      class_ids: JTensor | None = None,
+      class_probabilities: JTensor | None = None,
+  ) -> tuple[JTensor, JTensor, JTensor, JTensor]:
+    """Computes logits and softmax cross entropy.
+
+    Args:
+      inputs:        [..., input_dims].
+      class_ids:     [..., 1], int32 type, target labels.
+      class_probabilities: [..., num_classes].
+
+    Returns:
+      per_example_argmax: [...]. argmax of i-th example.
+      per_example_xent:   [...]. Cross entropy between i-th example's
+        prediction and its label.
+      logits:    [..., num_classes], unnormalized softmax logits.
+      log_probs: [..., num_classes], normalized softmax logits.
+    """
+
     # Compute logits
-    inputs_dtype = inputs.dtype
     logits = self.get_logits(inputs)
     # We perform softmax in float32 to improve stability.
     logits = logits.astype(jnp.float32)
@@ -327,43 +417,43 @@ class FullSoftmax(base_layer.BaseLayer):
     per_example_argmax = jax.lax.stop_gradient(
         jnp.argmax(logits.astype(jnp.float32), axis=-1)
     )
+    return per_example_xent, per_example_argmax, logits, log_probs
 
-    # Compute total softmax cross-entropy loss for the output tensor.
-    total_xent = jnp.sum(
-        jnp.expand_dims(per_example_xent, axis=-1) * class_weights,
-        dtype=jnp.float32,
-    )
-    total_weight = jnp.sum(class_weights, dtype=jnp.float32)
+  @nn.nowrap
+  def _compute_xent_scan(
+      self,
+      inputs: JTensor,
+      class_ids: JTensor,
+  ) -> tuple[JTensor, JTensor]:
+    """Computes softmax cross entropy using scan.
 
-    if self.z_loss_weight > 0.0:
-      z_loss = (
-          jnp.sum(_compute_z_loss(logits) * class_weights, dtype=jnp.float32)
-          / total_weight
+    Args:
+      inputs:        [B, L, input_dims].
+      class_ids:     [B, L, 1], int32 type, target labels.
+
+    Returns:
+      per_example_xent: [B, L]. Cross entropy between i-th example's
+      per_example_argmax: [B, L]. argmax of i-th example.
+    """
+
+    def step_fn(_, step_inputs):
+      inputs, class_ids = step_inputs
+      per_example_xent, per_example_argmax, _, _ = self._compute_xent(
+          inputs, class_ids
       )
-      z_loss *= self.z_loss_weight
-      self.add_summary('aux_z_loss', z_loss)
-      self.add_aux_loss('aux_z_loss', z_loss)
+      return None, (per_example_xent, per_example_argmax)
 
-    output_nmap = NestedMap(
-        logits=logits.astype(inputs_dtype),
-        log_probs=log_probs.astype(inputs_dtype),
-        per_example_argmax=per_example_argmax,
-        per_example_xent=per_example_xent.astype(jnp.float32),
-        total_xent=total_xent,
-        total_weight=total_weight,
-        avg_xent=(total_xent / (total_weight + 1e-6)).astype(jnp.float32),
+    seqlen = inputs.shape[1]
+    input_chunk = chunk.chunk(inputs, chunk_size=self.chunk_size)
+    class_ids = chunk.chunk(class_ids, chunk_size=self.chunk_size)
+    # Workaround: flax lazy init doesn't work in scan, so init all sublayers.
+    step_fn(None, (input_chunk[0, :1], class_ids[0, :1]))
+    _, (per_example_xent, per_example_argmax) = jax.lax.scan(
+        jax.remat(step_fn), None, (input_chunk, class_ids)
     )
-    if class_ids is not None:
-      output_nmap.accuracy = (
-          jnp.sum(
-              (per_example_argmax[..., jnp.newaxis] == class_ids)
-              * class_weights
-          )
-          / total_weight
-      )
-    if self.z_loss_weight > 0.0:
-      output_nmap['z_loss'] = z_loss
-    return output_nmap
+    per_example_xent = chunk.unchunk(per_example_xent, seqlen=seqlen)
+    per_example_argmax = chunk.unchunk(per_example_argmax, seqlen=seqlen)
+    return per_example_xent, per_example_argmax
 
 
 class SharedEmbeddingSoftmax(FullSoftmax):
@@ -390,9 +480,11 @@ class SharedEmbeddingSoftmax(FullSoftmax):
 
     Attributes:
       emb_out_split_dims_mapping: Sharding of the emb output.
+      extend_step_out: Sharding annotations for the primary extend step output.
     """
 
     emb_out_split_dims_mapping: SplitDimsMapping = None
+    extend_step_out: SplitDimsMapping = None
 
   def emb_lookup(self, ids: JTensor) -> JTensor:
     ap = self.activation_split_dims_mapping
@@ -419,6 +511,102 @@ class SharedEmbeddingSoftmax(FullSoftmax):
   def extend_step(self, ids: JTensor, *, time_step: JTensor) -> JTensor:
     del time_step  # Not used.
     return self.emb_lookup(ids)
+
+
+class NClassMajorSharedEmbeddingSoftmax(SharedEmbeddingSoftmax):
+  """A softmax layer that also supports embedding lookups.
+
+  The embedding table is constructed with num_classes as the major dimension.
+
+  Attributes:
+    activation_tpl: Sub configurable field for the activation layer.
+  """
+
+  activation_tpl: pax_fiddle.Config[activations.BaseActivation] = (
+      template_field(activations.Identity)
+  )
+  einsum_tpl: LayerTpl = template_field(base_ops.EinsumOp)
+  use_bias: bool = True
+
+  def setup(self) -> None:
+    wp = self.weight_split_dims_mapping
+    ap = self.activation_split_dims_mapping
+    wp_wt = None
+    if wp.wt is not None:
+      wp_wt = [wp.wt[1], wp.wt[0]]
+    self.create_variable(
+        'w',
+        WeightHParams(
+            shape=[self.num_classes, self.input_dims],
+            mesh_shape=self.mesh_shape,
+            tensor_split_dims_mapping=wp_wt,
+        ),
+    )
+    bias_layer_p = pax_fiddle.Config(
+        linears.Bias, dims=self.num_classes, bias_init=self.bias_init
+    )
+    if self.mesh_shape is not None and ap.out is not None:
+      wp_bias = [ap.out[-1]]
+      bias_layer_p.weight_split_dims_mapping.wt = wp_bias
+    if self.use_bias:
+      self.create_child('bias', bias_layer_p)
+    self.create_child('activation', self.activation_tpl.clone())
+    if self.bi_tempered_loss_tpl:
+      self.create_child('bi_tempered_loss', self.bi_tempered_loss_tpl)
+    self.create_child('einsum', self.einsum_tpl.clone())
+
+  def get_logits(
+      self, inputs: JTensor, input_ids: Optional[JTensor] = None
+  ) -> JTensor:
+    """Returns logits given the inputs with an option to soft cap it.
+
+    Args:
+      inputs: a single JTensor with shape [..., input_dim].
+      input_ids: Unused. Needed for API compatibility with downstream usage.
+
+    Returns:
+      logits: with shape [..., num_classes]. Unnormalized softmax's logits.
+    """
+    ap = self.activation_split_dims_mapping
+    projected_inputs = self.einsum('...y,zy->...z', inputs, self.theta.w)
+    ap_out = ap.out
+    if projected_inputs.ndim == 2:
+      if ap.extend_step_out is not None and len(ap.extend_step_out) == 2:
+        ap_out = ap.extend_step_out
+      elif ap_out is not None and len(ap_out) == 3:
+        ap_out = [ap_out[0], ap_out[2]]
+    projected_inputs = base_layer.maybe_shard(
+        projected_inputs, ap_out, self.mesh_axis_names
+    )
+    if self.use_bias:
+      projected_inputs = self.bias(projected_inputs)
+    logits = self.activation(projected_inputs)
+
+    # Soft cap logits if applicable.
+    if self.soft_cap_logits:
+      logits = self.soft_cap_logits * jnp.tanh(logits / self.soft_cap_logits)
+    return logits
+
+  def emb_lookup(self, ids: JTensor) -> JTensor:
+    ap = self.activation_split_dims_mapping
+    if self.lookup_style == 'index':
+      embs = jnp.asarray(self.theta.w)[(ids,)]
+    elif self.lookup_style == 'matmul':
+      # Explicit casting to fprop_dtype needed for bf16.
+      one_hot_ids = jax.nn.one_hot(
+          ids, self.num_classes, dtype=self.fprop_dtype
+      )
+      embs = linears.project_last_dim(one_hot_ids, self.theta.w)
+    else:
+      raise ValueError('Unknown lookup style.')
+    # Scale with sqrt(embedding dims)
+    if self.scale_sqrt_depth:
+      embs *= self.input_dims**0.5
+
+    embs = base_layer.maybe_shard(
+        embs, ap.emb_out_split_dims_mapping, self.mesh_axis_names
+    )
+    return embs
 
 
 class SigmoidCrossEntropy(base_layer.BaseLayer):
@@ -621,9 +809,11 @@ class GShardSharedEmbeddingSoftmax(base_layer.BaseLayer):
 
     Attributes:
       emb_out_split_dims_mapping: Mesh split for embedding outputs..
+      extend_step_out: Sharding annotations for the primary extend step output.
     """
 
     emb_out_split_dims_mapping: SplitDimsMapping = None
+    extend_step_out: SplitDimsMapping = None
 
   def setup(self) -> None:
     wp = self.weight_split_dims_mapping
@@ -674,8 +864,11 @@ class GShardSharedEmbeddingSoftmax(base_layer.BaseLayer):
     logits = linears.project_last_dim(inputs, softmax_var)
     # Adjust sharding annotation during decoding.
     ap_out = ap.out
-    if ap_out is not None and len(ap_out) == 3 and logits.ndim == 2:
-      ap_out = [ap_out[0], ap_out[2]]
+    if logits.ndim == 2:
+      if ap.extend_step_out is not None and len(ap.extend_step_out) == 2:
+        ap_out = ap.extend_step_out
+      elif ap_out is not None and len(ap_out) == 3:
+        ap_out = [ap_out[0], ap_out[2]]
     logits = base_layer.maybe_shard(logits, ap_out, self.mesh_axis_names)
 
     # Soft cap logits if applicable
@@ -1128,7 +1321,7 @@ class TrainablePositionalEmbedding(PositionalEmbedding):
     ap = self.activation_split_dims_mapping
     if position is None:
       assert seq_length is not None
-      position = jnp.arange(seq_length, dtype=jnp.float32)[jnp.newaxis, :]
+      position = jnp.arange(seq_length, dtype=jnp.int32)[jnp.newaxis, :]
     if seq_length is None:
       assert position is not None
       assert position.ndim == 2

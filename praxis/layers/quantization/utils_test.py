@@ -44,6 +44,12 @@ class UtilsTest(test_utils.TestCase):
           lhs_shape=(1, 2, 3, 4),
           rhs_shape=(4, 3, 1, 5),
       ),
+      dict(
+          # Tests einsum with non-matching contraction dimension orders.
+          eqn='ABCD,DC->AB',
+          lhs_shape=(1, 2, 3, 4),
+          rhs_shape=(4, 3),
+      ),
   )
   def test_einsum_equation_conversion(self, eqn, lhs_shape, rhs_shape):
     """Validate that lax.dot_general produces the same output as jnp.einsum."""
@@ -154,7 +160,7 @@ class UtilsTest(test_utils.TestCase):
     self.assertSequenceEqual(packed.shape, expected_packed_shape)
 
     unpacked = utils.unpack_4bit(packed, pack_dim, x.dtype)
-    self.assertArraysEqual(unpacked, x.astype(packed_dtype))
+    self.assertArraysEqual(unpacked, x)
 
   def test_get_packed_shape(self):
     self.assertSequenceEqual(utils.get_packed_shape((4, 8, 3), 1, 8), (4, 1, 3))
@@ -235,6 +241,87 @@ class UtilsTest(test_utils.TestCase):
             fdl.Config(Target, marker='target1_5'),
         ]),
     )
+
+  def test_lora_shape_and_eqn(self):
+    # One reduction dimension.
+    eqn = '...td,dD->...tD'
+    shape = (3, 5)
+    lora_size = 2
+    (
+        new_eqn_left,
+        new_eqn_right,
+        left_shape,
+        right_shape,
+        eqn_left_ind,
+        eqn_right_ind,
+    ) = utils.get_lora_shape_and_eqn(shape, lora_size, eqn)
+    self.assertEqual(new_eqn_left, '...td,da->...ta')
+    self.assertEqual(new_eqn_right, '...ta,aD->...tD')
+    self.assertEqual(left_shape, [3, 2])
+    self.assertEqual(right_shape, [2, 5])
+    self.assertEqual(eqn_left_ind, [1])
+    self.assertEqual(eqn_right_ind, [0])
+
+    # Two reduction dimensions.
+    eqn = '...tdh,dDh->...tD'
+    shape = (4, 5, 8)  # Max reduction dim is 'h' = 8
+    lora_size = 2
+    (
+        new_eqn_left,
+        new_eqn_right,
+        left_shape,
+        right_shape,
+        eqn_left_ind,
+        eqn_right_ind,
+    ) = utils.get_lora_shape_and_eqn(shape, lora_size, eqn)
+    self.assertEqual(new_eqn_left, '...tdh,ha->...tda')
+    self.assertEqual(new_eqn_right, '...tda,dDa->...tD')
+
+    self.assertEqual(left_shape, [8, 2])
+    self.assertEqual(right_shape, [4, 5, 2])
+    self.assertEqual(eqn_left_ind, [1])
+    self.assertEqual(eqn_right_ind, [2])
+
+    # Two reduction dimensions.
+    eqn = '...tdh,dDh->...tD'
+    shape = (8, 5, 4)  # Max reduction dim is 'd' = 8
+    lora_size = 2
+    (
+        new_eqn_left,
+        new_eqn_right,
+        left_shape,
+        right_shape,
+        eqn_left_ind,
+        eqn_right_ind,
+    ) = utils.get_lora_shape_and_eqn(shape, lora_size, eqn)
+    self.assertEqual(new_eqn_left, '...tdh,da->...tah')
+    self.assertEqual(new_eqn_right, '...tah,aDh->...tD')
+
+    self.assertEqual(left_shape, [8, 2])
+    self.assertEqual(right_shape, [2, 5, 4])
+    self.assertEqual(eqn_left_ind, [1])
+    self.assertEqual(eqn_right_ind, [0])
+
+    # Two reduction dimensions.
+    eqn = '...tdh,dDh->...tD'
+    shape = (8, 5, 4)  # Max reduction dim is 'd' = 8
+    lora_size = 2
+    (
+        new_eqn_left,
+        new_eqn_right,
+        left_shape,
+        right_shape,
+        eqn_left_ind,
+        eqn_right_ind,
+    ) = utils.get_lora_shape_and_eqn(shape, lora_size, eqn, max_reduction=False)
+
+    self.assertEqual(new_eqn_left, '...tdh,dhab->...tab')
+    self.assertEqual(new_eqn_right, '...tab,aDb->...tD')
+
+    self.assertEqual(left_shape, [8, 4, 2, 2])
+    self.assertEqual(right_shape, [2, 5, 2])
+    self.assertEqual(eqn_left_ind, [2, 3])
+    self.assertEqual(eqn_right_ind, [0, 2])
 
 
 if __name__ == '__main__':

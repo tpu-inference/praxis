@@ -85,6 +85,45 @@ class ConvolutionsTest(test_utils.TestCase):
     for i in [1, 2]:
       self.assertEqual(output.shape[i], inputs.shape[i] // filter_stride[i - 1])
 
+  @parameterized.parameters(
+      (2, 3, 2),
+      (2, 4, 2),
+      (3, 3, 2),
+      (3, 4, 2),
+  )
+  def test_conv_2d_for_causal_1d_conv(
+      self,
+      stride_time_dim,
+      filter_time_dim,
+      dilation_time_dim,
+  ):
+    filter_shape = (filter_time_dim, 1, 1, 1)
+    p = pax_fiddle.Config(
+        convolutions.Conv2D,
+        name='jax_conv2d',
+        filter_shape=filter_shape,
+        filter_stride=(stride_time_dim, 1),
+        dilations=(dilation_time_dim, 1),
+        is_causal=True,
+        tf_equivalent_padding=True,
+        padding='SAME',
+    )
+    conv_layer = instantiate(p)
+
+    length = 7
+    inputs = jnp.arange(length * stride_time_dim)[
+        jnp.newaxis, :, jnp.newaxis, jnp.newaxis
+    ].astype(jnp.float32)
+    prng_key = jax.random.PRNGKey(seed=123)
+    initial_vars = conv_layer.init(prng_key, inputs)
+    initial_vars['params']['w'] = jnp.ones(filter_shape)
+
+    output = conv_layer.apply(initial_vars, inputs)
+
+    # With padding == 'SAME' and stride > 1 output length should be
+    # (length*stride) / stride = length.
+    self.assertEqual(output.shape, (1, length, 1, 1))
+
   def test_causal_conv2d_layer(self):
     p = pax_fiddle.Config(
         convolutions.Conv2D,
@@ -124,6 +163,67 @@ class ConvolutionsTest(test_utils.TestCase):
         [[2.0, 6.0, 6.0], [28.0, 48.0, 36.0], [78.0, 126.0, 90.0]]
     )
     self.assertAllClose(to_np(output[0, :, :, 0]), np_output)
+
+    # Add some more causal tests using nan as indicator
+    # Case 1:
+    p = pax_fiddle.Config(
+        convolutions.Conv2D,
+        name='conv2d_nan',
+        filter_shape=[3, 1, 1, 1],
+        filter_stride=[2, 1],
+        padding='SAME',
+        is_causal=True,
+        tf_equivalent_padding=True,
+    )
+    conv_layer = instantiate(p)
+    conv_filter = {'params': {'w': jnp.ones([3, 1, 1, 1])}}
+    conv_layer = conv_layer.bind(conv_filter)
+    x = jnp.arange(7)[jnp.newaxis, :, jnp.newaxis, jnp.newaxis].astype(
+        jnp.float32
+    )
+    # x: [0, nan, 2, 3, 4, 5, 6]
+    x = x.at[:, 1, :, :].set(jnp.nan)
+    # expected y: [0, nan, 9, 15]
+    # 0 <-- x x 0
+    # nan <-- 0 nan 2
+    # 9 <-- 2 3 4
+    # 15 <-- 4 5 6
+    y = conv_layer(x)
+
+    assert y[0, 0, 0, 0] == 0
+    assert jnp.isnan(y[0, 1, 0, 0])
+    assert y[0, 2, 0, 0] == 9
+    assert y[0, 3, 0, 0] == 15
+
+    # Case 2:
+    p = pax_fiddle.Config(
+        convolutions.Conv2D,
+        name='conv2d_nan',
+        filter_shape=[2, 1, 1, 1],
+        filter_stride=[1, 1],
+        padding='SAME',
+        is_causal=True,
+        tf_equivalent_padding=True,
+    )
+    conv_layer = instantiate(p)
+    conv_filter = {'params': {'w': jnp.ones([2, 1, 1, 1])}}
+    conv_layer = conv_layer.bind(conv_filter)
+    x = jnp.arange(5)[jnp.newaxis, :, jnp.newaxis, jnp.newaxis].astype(
+        jnp.float32
+    )
+    # x: [0, nan, 2, 3, nan]
+    x = x.at[:, 1, :, :].set(jnp.nan)
+    x = x.at[:, -1, :, :].set(jnp.nan)
+    # expected y: [0, nan, nan, 5, nan]
+    y = conv_layer(x)
+
+    print('#bai#:', x[0, :, 0, 0])
+    print('#bai#:', y[0, :, 0, 0])
+    assert y[0, 0, 0, 0] == 0
+    assert jnp.isnan(y[0, 1, 0, 0])
+    assert jnp.isnan(y[0, 2, 0, 0])
+    assert y[0, 3, 0, 0] == 5
+    assert jnp.isnan(y[0, 4, 0, 0])
 
   @parameterized.parameters(
       ((2, 5, 4, 24, 36), (1, 1, 1), [2, 4, 16, 36, 72]),
@@ -468,7 +568,7 @@ class ConvolutionsTest(test_utils.TestCase):
     )
     layer = instantiate(test_layer_p)
     prng_key = jax.random.PRNGKey(seed=123)
-    prng_key, init_key = jax.random.split(prng_key)
+    _, init_key = jax.random.split(prng_key)
 
     inputs = np.random.normal(size=[1, 8, 4]).astype(np.float32)
     initial_vars = layer.init(init_key, inputs)

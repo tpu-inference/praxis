@@ -241,10 +241,13 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
         [batch_size, seq_len, dim_per_head].
       bld: Mesh split for output after post projection with the shape of
         [batch_size, seq_len, model_dim].
+      bd: Mesh split for extend step output after post projection with the shape
+        of [batch_size, model_dim].
     """
     blnh: SplitDimsMapping = None
     blh: SplitDimsMapping = None
     bld: SplitDimsMapping = None
+    bd: SplitDimsMapping = None
 
   def setup(self) -> None:
     wp = self.weight_split_dims_mapping
@@ -392,8 +395,12 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
       return x
     if ap.bld is None:
       return x
-    assert len(ap.bld) == 3
-    bd = [ap.bld[0], ap.bld[2]]
+    if ap.bd is not None:
+      bd = ap.bd
+      assert len(bd) == 2
+    else:
+      assert len(ap.bld) == 3
+      bd = [ap.bld[0], ap.bld[2]]
     return base_layer.maybe_shard(x, bd, self.mesh_axis_names)
 
   def _scale_query(self, query: JTensor) -> JTensor:
@@ -596,6 +603,7 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
       value_state_name: str,
       atten_mask: JTensor,
       relative_bias: JTensor | None = None,
+      time_step: JTensor | None = None,
   ) -> tuple[JTensor, JTensor]:
     """Dot attention function for queries with 1 time step.
 
@@ -609,6 +617,7 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
         is allowed to be of size 1, if the mask is shared by all items in the
         batch (e.g., only a causal mask).
       relative_bias: Relative bias of shape [1/B, N, 1, S].
+      time_step: A scalar or JTensor. Current time-step, 0-based.
 
     Returns:
       encoded: JTensor of shape [B, N, H].
@@ -625,7 +634,7 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
       key = self._shard_blh(key)
       value = self._shard_blh(value)
       encoded, probs = self._dot_atten_one_step_from_qkv(
-          query, key, value, atten_mask, relative_bias
+          query, key, value, atten_mask, relative_bias, time_step
       )
       return self._shard_bnh(encoded), probs
     else:
@@ -644,9 +653,9 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
       with self._context_for_kv_vmap():
         encoded, probs = jax.vmap(
             self._dot_atten_one_step_from_qkv,
-            in_axes=(1, 2, 2, None, 1),
+            in_axes=(1, 2, 2, None, 1, None),
             out_axes=(1, 1),
-        )(v_q, key, value, atten_mask, v_rb)
+        )(v_q, key, value, atten_mask, v_rb, time_step)
         encoded = self._shard_bnh(jnp.reshape(encoded, (b, n, h)))
         probs = jnp.reshape(probs, (b, n, -1))
         return encoded, probs
@@ -658,8 +667,10 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
       value: JTensor,
       atten_mask: JTensor,
       relative_bias: JTensor | None,
+      time_step: JTensor | None = None,
   ) -> tuple[JTensor, JTensor]:
     """_dot_atten_one_step with tensors instead of state names."""
+    del time_step
     # query is 3d.
     extend_one_step = len(query.shape) == 3
     b, s, h = key.shape
@@ -767,11 +778,14 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
         _rep_d(x) for x in [query_vec, key_vec, value_vec]
     ]
 
-    # Project inputs to key, value and query, respectively has shape
-    # [B, S, N, H], [B, S, H], and [B, T, H].
+    # Project inputs to query, key and value, respectively has shape
+    # [B, T, N, H], [B, S, H], and [B, S, H].
     query_proj = self.query(query_vec)
     key_proj = self.key(key_vec)
     value_proj = self.value(value_vec)
+    query_proj = checkpoint_name(query_proj, 'query_proj')
+    key_proj = checkpoint_name(key_proj, 'key_proj')
+    value_proj = checkpoint_name(value_proj, 'value_proj')
 
     if not self.consolidate_rope_key_state:
       self._fprop_update_decode_state('key_state', key_proj)
@@ -939,35 +953,28 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
     assert time_step.ndim == 0
     # Project inputs to key, value and query. Query has shape [B, N, H],
     # key/value shapes [B, H]
+    if extend_one_step:
+      query_vec = self._shard_bd(query_vec)
     query_proj = self.query(query_vec)
-    if not is_cross_attention:
-      key_proj = self.key(query_vec)
-      value_proj = self.value(query_vec)
+
     # TODO(b/290067837): Workaround for problems when batch dim is sharded
     # differently in bld and blnh.
     ap = self.activation_split_dims_mapping
+    sharding = None
     if ap.bld and ap.blnh:
-      query_proj = base_layer.maybe_shard(
-          query_proj,
-          [ap.bld[0], ap.blnh[2], ap.blnh[3]],
-          self.mesh_axis_names,
-      )
-      if not is_cross_attention:
-        if self.num_kv_heads == 1:
-          sharding = [ap.bld[0], ap.blnh[3]]
-        else:
-          sharding = [ap.bld[0], ap.blnh[2], ap.blnh[3]]
+      ap_b = ap.bd[0] if ap.bd else ap.bld[0]
+      sharding = [ap_b, ap.blnh[2], ap.blnh[3]]
+    query_proj = base_layer.maybe_shard(
+        query_proj, sharding, self.mesh_axis_names
+    )
 
-        value_proj = base_layer.maybe_shard(
-            value_proj,
-            sharding,
-            self.mesh_axis_names,
-        )
-        key_proj = base_layer.maybe_shard(
-            key_proj,
-            sharding,
-            self.mesh_axis_names,
-        )
+    if not is_cross_attention:
+      key_proj = self.key(query_vec)
+      value_proj = self.value(query_vec)
+      if ap.bld and ap.blnh:
+        if self.num_kv_heads == 1:
+          ap_b = ap.bd[0] if ap.bd else ap.bld[0]
+          sharding = [ap_b, ap.blnh[3]]
         value_proj = base_layer.maybe_shard(
             value_proj,
             sharding,
@@ -1027,19 +1034,24 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
     else:
       relative_bias = None
 
-    encoded, atten_prob = self._dot_atten_one_step(query_proj,
-                                                   key_state_name,
-                                                   value_state_name, atten_mask,
-                                                   relative_bias)
+    encoded, atten_prob = self._dot_atten_one_step(
+        query_proj,
+        key_state_name,
+        value_state_name,
+        atten_mask,
+        relative_bias,
+        time_step,
+    )
     # TODO(yonghui): return atten_probs back to the caller.
     del atten_prob
     # Post projection.
     if ap.bld and ap.blnh:
       # TODO(b/290067837): Workaround for problems when batch dim is sharded
       # differently in bld and blnh.
+      ap_b = ap.bd[0] if ap.bd else ap.bld[0]
       encoded = base_layer.maybe_shard(
           encoded,
-          [ap.bld[0], ap.blnh[2], ap.blnh[3]],
+          [ap_b, ap.blnh[2], ap.blnh[3]],
           self.mesh_axis_names,
       )
     encoded = self.post(encoded)

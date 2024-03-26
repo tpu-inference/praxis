@@ -16,6 +16,7 @@
 """Attention layers."""
 
 import functools
+from functools import partial
 import math
 import string
 from typing import Any, Callable, Mapping, Sequence
@@ -33,7 +34,6 @@ from praxis import py_utils
 from praxis import pytypes
 from praxis.layers import base_ops
 from praxis.layers import embedding_softmax
-from praxis.layers import normalizations
 from praxis.layers import stochastics
 
 NestedMap = py_utils.NestedMap
@@ -55,6 +55,7 @@ def limited_context_mask(
     right_context: int | None,
     time_size: int,
     dtype: jnp.dtype = jnp.float32,
+    column_time_size: int | None = None,
 ) -> JTensor:
   """Generates a logit mask from window configuration.
 
@@ -66,22 +67,26 @@ def limited_context_mask(
     right_context: integer or None
     time_size: size of time dimension.
     dtype: data type of the output.
+    column_time_size: size of the column time dimension, defaults to time_size
 
   Returns:
-    A JTensor of shape [T, T] ready to add to attention logits.
+    A JTensor of shape [time_size, column_time_size] ready to add to attention
+    logits.
   """
   large_negative_number = py_utils.get_large_negative_number(dtype)
 
+  if column_time_size is None:
+    column_time_size = time_size
+
   if right_context is None:
-    right_context = time_size
+    right_context = max(time_size, column_time_size)
   if left_context is None:
-    left_context = time_size
-  col_idx = jnp.tile(jnp.arange(time_size)[jnp.newaxis, :], [time_size, 1])
-  row_idx = jnp.tile(jnp.arange(time_size)[:, jnp.newaxis], [1, time_size])
-  mask = (
+    left_context = max(time_size, column_time_size)
+  col_idx = jnp.arange(column_time_size)[jnp.newaxis, :]
+  row_idx = jnp.arange(time_size)[:, jnp.newaxis]
+  return (
       (col_idx + left_context <= row_idx) | (row_idx < col_idx - right_context)
   ).astype(dtype) * large_negative_number
-  return mask
 
 
 def causal_mask(input_t: JTensor) -> JTensor:
@@ -94,9 +99,7 @@ def causal_mask(input_t: JTensor) -> JTensor:
     An attention_mask JTensor of shape [1, 1, T, T]. Attention mask has
     already been converted large negative values.
   """
-  assert (
-      input_t.dtype == jnp.float32 or input_t.dtype == jnp.bfloat16
-  ), input_t.dtype
+  assert jnp.issubdtype(input_t.dtype, jnp.floating), input_t.dtype
   large_negative_number = py_utils.get_large_negative_number(input_t.dtype)
   t = input_t.shape[1]
   col_idx = jnp.tile(jnp.arange(t)[jnp.newaxis, :], [t, 1])
@@ -1142,6 +1145,8 @@ class DotProductAttention(base_layer.BaseLayer):
       keys are all padded.
     ln_tpl: Parameterization of the layer normalization layer used in QK norm.
       Other options include RmsNorm as well.
+    decoding_maybe_shard_projections: Adds sharding to query_proj, key_proj,
+      value_proj, and encoded.
   """
 
   input_dim: int | dict[str, int] = 0
@@ -1182,6 +1187,7 @@ class DotProductAttention(base_layer.BaseLayer):
   per_dim_scale_tpl: LayerTpl = template_field(PerDimScale)
   causal_depthwise_conv1d_tpl: LayerTpl = template_field(CausalDepthwiseConv1D)
   ln_tpl: LayerTpl | None = template_field(None)
+  decoding_maybe_shard_projections: bool = False
 
   # SPMD partition related params.
   #
@@ -1877,6 +1883,21 @@ class DotProductAttention(base_layer.BaseLayer):
         key_proj = self.key.extend_step(query_vec, time_step=time_step)
         value_proj = self.value.extend_step(query_vec, time_step=time_step)
 
+    if self.decoding_maybe_shard_projections:
+      ap = self.activation_split_dims_mapping
+      query_proj = base_layer.maybe_shard(
+          query_proj, [ap.bld[0], ap.blnh[2], ap.blnh[3]], self.mesh_axis_names
+      )
+      key_proj = base_layer.maybe_shard(
+          key_proj, [ap.bld[0], ap.blnh[2], ap.blnh[3]], self.mesh_axis_names
+      )
+      value_proj = base_layer.maybe_shard(
+          value_proj, [ap.bld[0], ap.blnh[2], ap.blnh[3]], self.mesh_axis_names
+      )
+      query_proj = self._shard_bnh(query_proj)
+      key_proj = self._shard_bnh(key_proj)
+      value_proj = self._shard_bnh(value_proj)
+
     def _extend_decode_state_and_shard(
         name: str, extend_value: JTensor
     ) -> JTensor:
@@ -1888,7 +1909,10 @@ class DotProductAttention(base_layer.BaseLayer):
     key_state_name = 'key_state'
     value_state_name = 'value_state'
     if not is_cross_attention:
-      key_state = _extend_decode_state_and_shard(key_state_name, key_proj)
+      # No need to update key_state at this point if consolidate_rope_key_state
+      # is set.
+      if not (self.use_rotary_position_emb and self.consolidate_rope_key_state):
+        key_state = _extend_decode_state_and_shard(key_state_name, key_proj)
       value_state = _extend_decode_state_and_shard(value_state_name, value_proj)
 
     # Apply depth-wise convolution as in Primer.
@@ -1953,6 +1977,10 @@ class DotProductAttention(base_layer.BaseLayer):
         relative_bias,
         time_step=time_step,
     )
+    if self.decoding_maybe_shard_projections:
+      encoded = base_layer.maybe_shard(
+          encoded, [ap.bld[0], ap.blnh[2], ap.blnh[3]], self.mesh_axis_names
+      )
     # TODO(yonghui): return atten_probs back to the caller.
 
     # Apply NGrammer to the output of the attention.
@@ -2399,7 +2427,9 @@ class DotProductAttentionWithLPB(DotProductAttention):
       relative_bias = jnp.reshape(
           relative_bias, batch_dims + relative_bias.shape[1:]
       )
-    am_batched = atten_mask.shape[0] > 1
+    am_batched = (
+        not isinstance(atten_mask.shape[0], int) or atten_mask.shape[0] > 1
+    )
     if am_batched:
       atten_mask = jnp.reshape(atten_mask, batch_dims + atten_mask.shape[1:])
 
@@ -2796,15 +2826,16 @@ def create_relative_positional_embedding(
   pos_proj_tpl.weight_split_dims_mapping.wt = wp.proj
   layer.create_child('pos_proj', pos_proj_tpl)
 
-  u_pc = WeightHParams(
-      shape=[layer.num_heads, dim_per_head], init=WeightInit.Constant(0.0)
-  )
-  v_pc = WeightHParams(
-      shape=[layer.num_heads, dim_per_head], init=WeightInit.Constant(0.0)
-  )
+  if layer.use_bias:
+    u_pc = WeightHParams(
+        shape=[layer.num_heads, dim_per_head], init=WeightInit.Constant(0.0)
+    )
+    v_pc = WeightHParams(
+        shape=[layer.num_heads, dim_per_head], init=WeightInit.Constant(0.0)
+    )
 
-  layer.create_variable('u', u_pc)
-  layer.create_variable('v', v_pc)
+    layer.create_variable('u', u_pc)
+    layer.create_variable('v', v_pc)
 
 
 class DotProductAttentionXL(DotProductAttention):
@@ -2843,7 +2874,7 @@ class DotProductAttentionXL(DotProductAttention):
     H: per-head attention dimension.
 
     Args: tensors of the following shapes:
-      content:          B, T, N, H]
+      content:         [B, T, N, H]
       abs_pos_emb:     [2T - 1, N, H], the absolute positional embedding.
       abs_pos_emb[i] is the emb of relative distance i - (T-1).
 
@@ -2878,11 +2909,12 @@ class DotProductAttentionXL(DotProductAttention):
     sin_emb = jnp.squeeze(sin_emb, 0)
 
     # [B, N, T, S=T]
-    content = query + self.theta.u
-    term_ac = jnp.einsum('BTNH,BSNH->BNTS', content, key)
-
-    content = query + self.theta.v
-    term_bd = self._rel_position_bias(content, sin_emb)
+    if self.use_bias:
+      term_ac = jnp.einsum('BTNH,BSNH->BNTS', query + self.theta.u, key)
+      term_bd = self._rel_position_bias(query + self.theta.v, sin_emb)
+    else:
+      term_ac = jnp.einsum('BTNH,BSNH->BNTS', query, key)
+      term_bd = self._rel_position_bias(query, sin_emb)
     return term_ac + term_bd
 
   def _atten_logits_one_step(self, query, key, step):
@@ -2890,7 +2922,7 @@ class DotProductAttentionXL(DotProductAttention):
     s = key.shape[1]
 
     # [1, S]
-    pos = jnp.expand_dims(jnp.arange(t - 1, t - s - 1, -1), 0)
+    pos = jnp.expand_dims(t - 1 - jnp.arange(s), 0)
     sin_emb = self.pos_emb(position=pos)
     # [1, S, N, H]
     sin_emb = self.pos_proj(sin_emb)
@@ -2898,11 +2930,12 @@ class DotProductAttentionXL(DotProductAttention):
     sin_emb = jnp.squeeze(sin_emb, 0)
 
     # [B, N, T, S=T]
-    content = query + self.theta.u
-    term_ac = jnp.einsum('BNH,BSNH->BNS', content, key)
-
-    content = query + self.theta.v
-    term_bd = jnp.einsum('BNH,TNH->BNT', content, sin_emb)
+    if self.use_bias:
+      term_ac = jnp.einsum('BNH,BSNH->BNS', query + self.theta.u, key)
+      term_bd = jnp.einsum('BNH,TNH->BNT', query + self.theta.v, sin_emb)
+    else:
+      term_ac = jnp.einsum('BNH,BSNH->BNS', query, key)
+      term_bd = jnp.einsum('BNH,TNH->BNT', query, sin_emb)
     return term_ac + term_bd
 
   def _dot_atten_one_step(
@@ -3114,14 +3147,20 @@ class LocalSelfAttention(DotProductAttention):
     left_context: Number of left positions to attend (including current
       position).
     right_context: Number of right positions to attend.
+    simulated: If True, the computation will be done by simply applying a local
+      mask. This is faster when the block size is close to the full sequence
+      length.
   """
 
   block_size: int | None = None
   left_context: int | None = None
   right_context: int | None = None
+  simulated: bool = False
 
   def _atten_logits(self, query: JTensor, key: JTensor) -> JTensor:
     """Computes logits from query and key."""
+    if self.simulated:
+      return super()._atten_logits(query, key)
     logits = jnp.einsum('buwnh,bucnh->bnuwc', query, key)
     return logits
 
@@ -3150,6 +3189,18 @@ class LocalSelfAttention(DotProductAttention):
       encoded: JTensor of shape [B, T, N, H].
       atten_probs: JTensor of shape [B, N, T, S].
     """
+
+    if self.simulated:
+      local_atten_mask = limited_context_mask(
+          self.left_context,
+          self.right_context,
+          time_size=query.shape[1],
+          column_time_size=key.shape[1],
+      )
+      atten_mask = jnp.minimum(atten_mask, local_atten_mask)
+
+      return super()._dot_atten(query, key, value, atten_mask, relative_bias)
+
     # Relative bias is not supported yet
     if relative_bias is not None:
       raise NotImplementedError(
@@ -3336,7 +3387,7 @@ class LocalSelfAttention(DotProductAttention):
         time_step + 1 - l,
         f,
         -1,
-        py_utils.get_large_negative_number(jnp.float32),
+        py_utils.get_large_negative_number(atten_mask.dtype),
     )
 
     b, f, n, h = key.shape
@@ -3408,6 +3459,8 @@ class LocalSelfAttentionXL(LocalSelfAttention):
   def setup(self) -> None:
     """Constructs a LocalSelfAttentionXL object."""
     super().setup()
+    if self.simulated:
+      raise ValueError('simulated is not supported for %s' % self.__name__)
     create_relative_positional_embedding(self)
 
   def _atten_logits(self, query, key):
@@ -3418,7 +3471,10 @@ class LocalSelfAttentionXL(LocalSelfAttention):
     r = self.right_context
     f = l + r
     # term a and c
-    term_ac = jnp.einsum('BUWNH,BUCNH->BNUWC', query + self.theta.u, key)
+    if self.use_bias:
+      term_ac = jnp.einsum('BUWNH,BUCNH->BNUWC', query + self.theta.u, key)
+    else:
+      term_ac = jnp.einsum('BUWNH,BUCNH->BNUWC', query, key)
 
     # term b and d
     # [1, F]
@@ -3431,7 +3487,10 @@ class LocalSelfAttentionXL(LocalSelfAttention):
     sin_emb = jnp.squeeze(sin_emb, 0)
 
     # [B, N, U, W, F]
-    term_bd = jnp.einsum('BUWNH,FNH->BNUWF', query + self.theta.v, sin_emb)
+    if self.use_bias:
+      term_bd = jnp.einsum('BUWNH,FNH->BNUWF', query + self.theta.v, sin_emb)
+    else:
+      term_bd = jnp.einsum('BUWNH,FNH->BNUWF', query, sin_emb)
 
     # Perform relative shift in order to get [B, N, U, W, C]
     # Pads the input to [B, N, U, W, C + 1]
@@ -3456,3 +3515,101 @@ class LocalSelfAttentionXL(LocalSelfAttention):
     raise NotImplementedError(
         'extend_step is not implemented for %s' % self.__name__
     )
+
+
+class LocalSelfAttentionRelativeBias(LocalSelfAttention):
+  """Local version of trainable relative bias position encoding.
+
+  See DIET-REL in https://arxiv.org/abs/2104.08698.
+  """
+
+  def setup(self) -> None:
+    """Constructs a LocalSelfAttentionRelativeBias object with fixed pos_emb."""
+    super().setup()
+    # Number of possible relative positional distance indices =
+    #   C + (W - 1) =
+    #   [(L - 1) + W + R] + (W - 1) =
+    #   L + R + 2 * (W - 1).
+    #
+    # Conceptually, num_positions =
+    #   [- (L - 1) - (W - 1), ..., 0, ..., (W - 1) + R]
+    w = self.block_size
+    c = w + self.left_context + self.right_context - 1
+    num_positions = c + w - 1
+
+    pc = WeightHParams(shape=[self.num_heads, num_positions])
+    self.create_variable('pos_emb_compressed', pc)
+
+  def _atten_logits(self, query, key):
+    b, u, w, n, _ = query.shape[:5]
+    c = w + self.left_context + self.right_context - 1
+
+    # reconstruct the Toeplitz matrix
+    # -> [N, W, C]
+    pos_emb_compressed = self.theta.pos_emb_compressed
+    self.add_summary('pos_emb_compressed', jnp.sum(pos_emb_compressed))
+    pos_bias = jnp.tile(pos_emb_compressed, [1, w])[:, : w * (w + c - 2)]
+    pos_bias = jnp.reshape(pos_bias, [n, w, w + c - 2])
+    pos_bias = pos_bias[..., w - 2 :]
+
+    # -> [B, N, U, W, C]
+    pos_bias = pos_bias[jnp.newaxis, :, jnp.newaxis, :, :]
+    pos_bias = jnp.broadcast_to(pos_bias, (b, n, u, w, c))
+
+    logits = jnp.einsum('buwnh,bucnh->bnuwc', query, key)
+    logits += pos_bias
+
+    return logits
+
+
+class LocalSelfAttentionAlibi(LocalSelfAttention):
+  """Local version of non-trainable relative bias position encoding.
+
+  See ALiBi in https://arxiv.org/abs/2108.12409.
+  """
+
+  def setup(self) -> None:
+    """Constructs a LocalSelfAttentionAlibi object with fixed pos_emb."""
+    super().setup()
+
+  def _atten_logits(self, query, key):
+    b, u, w, n, _ = query.shape[:5]
+    c = w + self.left_context + self.right_context - 1
+
+    # -> [N, W, C]
+    # reconstruct the Toeplitz matrix
+    num_pos = c + w - 1
+    # Assume this will be replaced with variables
+    abs_pos_indices = jnp.arange(num_pos + 1)
+    # broadcast to each head to represent "shared" indices value
+    abs_pos_indices = jnp.broadcast_to(abs_pos_indices, [n, w + c])
+    pos_bias = jnp.tile(abs_pos_indices, [1, w])[:, : w * (w + c - 1)]
+    pos_bias = jnp.reshape(pos_bias, [n, w, w + c - 1])
+    pos_bias = pos_bias[..., w - 1 :]
+
+    # Construct ALiBi
+    # -> [N, W, C]
+    @partial(jax.jit, static_argnums=0)
+    def _get_slopes(n_heads):
+      n = 2 ** np.floor(np.log2(n_heads))
+      m_0 = 2.0 ** (-8.0 / n)
+      m = m_0 ** jnp.arange(1, 1 + n_heads)
+
+      if n < n_heads:
+        m_hat_0 = 2.0 ** (-4.0 / n)
+        m_hat = m_hat_0 ** jnp.arange(1, 1 + 2 * (n_heads - n), 2)
+        m = jnp.concatenate([m, m_hat])
+
+      return m
+
+    m = _get_slopes(n)
+    alibi = pos_bias * m[:, None, None]
+
+    # -> [B, N, U, W, C]
+    pos_bias = alibi[None, :, None, :, :]
+    pos_bias = jnp.broadcast_to(pos_bias, (b, n, u, w, c))
+
+    logits = jnp.einsum('buwnh,bucnh->bnuwc', query, key)
+    logits += pos_bias
+
+    return logits

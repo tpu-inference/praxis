@@ -31,11 +31,13 @@ class QuantizationType(str, enum.Enum):
   AQT: Accurate Quantized Training, which is one flavor of QAT.
   FQ:  Fake Quantization, which is one flavor of QAT.
   FQ_VN:  Use variational noise to emulate quantization noise.
+  FR: Fr quantization.
   """
   PTQ = 'ptq'
   AQT = 'aqt'
   FQ = 'fq'
   FQ_VN = 'fq_vn'
+  FR = 'fr'
   # Internal quantization type.
 
 
@@ -49,10 +51,39 @@ class QuantizationMode(str, enum.Enum):
     INFERENCE. This mode is referenced only by `ServableModelParams` for
     serving.
   INFERENCE indicates that the model is in inference mode.
+  QT indicates the model will train with quantization.
+  CALIB inidates that the model is going to be calibrated.
   """
   TRAINING = 'training'
   MATERIALIZE = 'materialize'
   INFERENCE = 'inference'
+  QT = 'qt'
+  CALIB = 'calib'
+
+
+@enum.unique
+class TransformerLayer(str, enum.Enum):
+  """Transformer layer types used in quantization.
+
+  Users can use this enum to specify mixed precision quantization
+  for transformer models.
+
+  LINEAR: The FFN layer weight in a transformer.
+  LINEAR_ACT: The FFN layer activation in a transformer.
+  ATTENTION: The attention layer weight.
+  ATTENTION_ACT: The attention layer activation.
+  EMBEDDING_SOFTMAX: Embedding for the softmax layer.
+  EMBEDDING_SOFTMAX_ACT: Embedding activation for the softmax layer.
+  EMBEDDING_NGRAMMER: Embedding for the ngrammar layer.
+  """
+
+  LINEAR = 'linear'
+  LINEAR_ACT = 'linear_activation'
+  ATTENTION = 'attention'
+  ATTENTION_ACT = 'attention_activation'
+  EMBEDDING_SOFTMAX = 'embedding_softmax'
+  EMBEDDING_SOFTMAX_ACT = 'embedding_softmax_activation'
+  EMBEDDING_NGRAMMER = 'embedding_ngrammer'
 
 
 @dataclasses.dataclass
@@ -117,6 +148,16 @@ class WeightQuantizationParams:
   use_int4_packed_weights: If True, pack/unpack int4 weights into int32 or int8.
     It is for int4 weights only and has not effect on other type.
     If False int4 weights will be kept in int8.
+    There are several edge cases:
+      1. use_int4_packed_weights=True, precision=4, dtype=jnp.int8
+        It keeps int4 values in int8 type and packs it into int8 or int32
+        depending on int4_packed_weights_container_dtype.
+      2. use_int4_packed_weights=False, precision=4, dtype=jnp.int8
+        It keeps int4 values in int8 type.
+      3. use_int4_packed_weights=False, precision=4, dtype=jnp.int4
+        It will use native jnp.int4 type.
+      4. use_int4_packed_weights=True, precision=4, dtype=jnp.int4
+        it will raise an error.
   int4_packed_weights_container_dtype: Container type for int4 weights:
     int32 to pack 8 int4s, or int8 to pack 2 int4s.
   vn_scale: Scale coefficient for VN quantization. TODO(rybakov) use bits.
@@ -132,6 +173,11 @@ class WeightQuantizationParams:
     It is based on paper: "Robust Quantization: One Model to Rule Them All".
   block_size: block size for sub channel quantization. 0 to set it off. Defaults
     to off.
+  quant_method: Quantization method:
+    * 'default' - extracts min and max for quantization scale estimation.
+      It is well applied for int8, in4, int2 quantization.
+    * 'bin' - binarization, where scale is defined by mean|w|.
+    * 'bin_norm' - binarization with weight normalization.
   """
   precision: int = 8
   unsigned_int_bounds: bool = False
@@ -158,6 +204,7 @@ class WeightQuantizationParams:
   kurt: float = 1.8
   block_size: int = 0
   # Internal quantization parameters.
+  quant_method: str = 'default'
 
 
 @dataclasses.dataclass

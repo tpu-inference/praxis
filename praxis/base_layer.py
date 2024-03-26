@@ -37,6 +37,7 @@ from flax import struct
 import jax
 from jax import numpy as jnp
 from jax import random as jrandom
+from jax.interpreters import pxla
 import numpy as np
 from praxis import asserts
 from praxis import base_hyperparams
@@ -161,6 +162,7 @@ class WeightHParamsCollection:
   REQUIRES_MEAN_SYNC = '_requires_mean_sync'
   REQUIRES_SUM_SYNC = '_requires_sum_sync'
   DISALLOW_BFLOAT16_CONVERSION = '_disallow_bfloat16_conversion'
+  OVERWRITE_WITH_GRADIENT = '_overwrite_with_gradient'
 
 
 def var_not_trainable(var_hparams: ParamsT) -> bool:
@@ -187,6 +189,27 @@ def var_disallow_bfloat16_conversion(var_hparams: ParamsT) -> bool:
 def var_skip_lp_regularization(var_params: ParamsT) -> bool:
   return (
       WeightHParamsCollection.SKIP_LP_REGULARIZATION in var_params.collections
+  )
+
+
+def var_overwrite_with_gradient(var_hparams: ParamsT) -> bool:
+  """Returns True if var_hparams is OWG (overwrite_with_gradient) variable.
+
+  OWG variables are semi-trainable; their new values are directly assigned as
+  `x = grad`. In other words, after each training step, they are overwritten by
+  the gradient value with respect to themselves. In contrast, regular trainable
+  variables are updated by the learner through the formula
+  `x = x + update(grad)`. Non-trainable variables, on the other hand, remain
+  unchanged, i.e., `x = x`.
+
+  Args:
+    var_hparams: WeightHParams used to create the variable.
+
+  Returns:
+    True if var_hparams belongs to OWG collection.
+  """
+  return (
+      WeightHParamsCollection.OVERWRITE_WITH_GRADIENT in var_hparams.collections
   )
 
 
@@ -258,7 +281,39 @@ def var_partition_specs(
   def _get_spec(var_p: WeightHParams) -> jax.sharding.PartitionSpec:
     return to_partition_spec(var_p.full_split_dims_mapping, device_axis_names)
 
-  return jax.tree_map(_get_spec, var_specs)
+  return jax.tree_util.tree_map(_get_spec, var_specs)
+
+
+def transpose_one_axis(
+    axis: str | None, mesh_axes_transpose: dict[str, str] | None
+) -> str | None:
+  """Remap one device mesh axis based on mesh_axes_transpose."""
+  if mesh_axes_transpose is None or axis is None:
+    return axis
+  assert isinstance(axis, str)
+  return mesh_axes_transpose.get(axis, axis)
+
+
+def maybe_transpose_mesh_axes(
+    partition_spec: jax.sharding.PartitionSpec,
+) -> jax.sharding.PartitionSpec:
+  """Remap device mesh axes if mesh_axes_transpose exists."""
+  if JaxContext.has_context():
+    mapping = cur_jax_context().hparams.mesh_axes_transpose
+    if mapping:
+
+      def _transpose_one_dim(axes):
+        if axes == jax.sharding.PartitionSpec.UNCONSTRAINED:
+          return axes
+        if axes is None or isinstance(axes, str):
+          return transpose_one_axis(axes, mapping)
+        mapped_axes = [_transpose_one_dim(x) for x in axes]
+        return tuple(x for x in mapped_axes if x)
+
+      partition_spec = jax.sharding.PartitionSpec(
+          *[_transpose_one_dim(x) for x in partition_spec]
+      )
+  return partition_spec
 
 
 def maybe_shard(
@@ -308,22 +363,7 @@ def maybe_shard(
       f'x.shape = {x.shape} and split_dims_mapping = {split_dims_mapping}'
   )
   partition_spec = to_partition_spec(split_dims_mapping, mesh_axis_names)
-
-  if JaxContext.has_context():
-    mapping = cur_jax_context().hparams.mesh_axes_transpose
-    if mapping:
-
-      def _transpose_one_dim(axes):
-        if axes is None:
-          return axes
-        if isinstance(axes, str):
-          return mapping.get(axes, axes)
-        mapped_axes = [_transpose_one_dim(x) for x in axes]
-        return tuple(x for x in mapped_axes if x)
-
-      partition_spec = jax.sharding.PartitionSpec(
-          *[_transpose_one_dim(x) for x in partition_spec]
-      )
+  partition_spec = maybe_transpose_mesh_axes(partition_spec)
 
   if unconstrained_dims is not None:
     partition_spec_list = list(partition_spec)
@@ -343,7 +383,7 @@ class WeightInit:
     scale: Initialization scale.
   """
   method: str
-  scale: float
+  scale: float | int
 
   @pax_fiddle.auto_config
   @staticmethod
@@ -376,7 +416,7 @@ class WeightInit:
 
   @pax_fiddle.auto_config
   @staticmethod
-  def Constant(scale: float | bool = 1.0) -> WeightInit:
+  def Constant(scale: float | int = 1.0) -> WeightInit:
     """scale."""
     return WeightInit('constant', scale)
 
@@ -633,10 +673,14 @@ def init_var(
   init_dtype = var_p.dtype
   fan_in_axes = var_p.fan_in_axes
   fan_out_axes = var_p.fan_out_axes
-  logging.info(
+  logging.debug(
       'Creating var %s with shape=%s, dtype=%s, init method=%s and scale=%s',
-      var_full_name, shape, init_dtype, var_p.init.method,
-      var_p.init.scale)
+      var_full_name,
+      shape,
+      init_dtype,
+      var_p.init.method,
+      var_p.init.scale,
+  )
   # We rely on nn.scan to transform vars, hence init_var shouldn't expect a
   # repeat_prefix or repeat_prefix_split_dims_mapping.
   assert not var_p.repeat_prefix
@@ -711,7 +755,16 @@ def init_var(
     return scale * jrandom.truncated_normal(
         prng_key, lower=-2.0, upper=2.0, shape=shape, dtype=init_dtype)
   elif method in ['constant']:
-    return scale + jnp.zeros(shape=shape, dtype=init_dtype)
+    if jnp.issubdtype(init_dtype, jnp.integer) and not isinstance(scale, int):
+      raise ValueError(
+          'An integer scale must be provided when initializing an '
+          f'integer variable (of type {init_dtype}), but got {scale=}'
+      )
+    if init_dtype in [jnp.int4, jnp.uint4]:
+      # jnp.zeros(dtype=int4) is not currently supported.
+      return (scale + jnp.zeros(shape=shape, dtype=jnp.int8)).astype(init_dtype)
+    else:
+      return scale + jnp.zeros(shape=shape, dtype=init_dtype)
   elif method in ['xavier']:
     fan_in, fan_out = get_fan_in_fan_out(shape, fan_in_axes, fan_out_axes)
     limit = scale * math.sqrt(6. / (fan_in + fan_out))
@@ -944,12 +997,80 @@ class AuxLossStruct:
   weight: JTensor
 
 
+def _is_internal_meta(meta: Any) -> bool:
+  # Internal metadata is invisible to pax, so we check the name instead.
+  return type(meta).__name__ == 'InternalMeta'
+
+
+def _is_meta(x):
+  return isinstance(x, BoxedParam) or _is_internal_meta(x)
+
+
 def maybe_unbox_value(tree):
   """Return the `value` leaf component of the pytree if it is a BoxedParam."""
-  return jax.tree_map(
-      lambda bp: bp.value if isinstance(bp, BoxedParam) else bp,
-      tree,
-      is_leaf=lambda x: isinstance(x, BoxedParam))
+  return jax.tree_util.tree_map(
+      lambda bp: bp.value if _is_meta(bp) else bp, tree, is_leaf=_is_meta
+  )
+
+
+def _internal_meta_to_hparams(meta: Any) -> WeightHParams:
+  # Checks and converts the axis types.
+  ndim = len(meta.value.shape)
+  stacked_ended = False
+  repeat_prefix = []
+  fan_in_axes = []
+  for idx, t in enumerate(meta.axes_types):
+    if t is not None and t.name == 'STACKED':
+      if stacked_ended:
+        raise ValueError(
+            'Incompatible axes types: expect STACKED axes at the beginning,'
+            f' got {meta.axes_types}.'
+        )
+      repeat_prefix.append(meta.value.shape[idx])
+      continue
+
+    stacked_ended = True
+
+    if t is None:
+      pass
+    elif t.name == 'FANIN':
+      fan_in_axes.append(idx - ndim)  # Pax use negative fanin/fanout axes.
+    elif t.name == 'CHANNEL':
+      # TODO(laigd): CHANNEL type is used widely, skipping for now.
+      pass
+    else:
+      raise ValueError(f'Unsupported axis type: {t}.')
+
+  # Creates the WeightHParams.
+  shape = meta.value.shape[len(repeat_prefix) :]
+  param = WeightHParams(shape=shape)
+  param.dtype = meta.value.dtype
+  param.init = WeightInit.Constant(meta.value)  # TODO(laigd): do we need this?
+
+  if meta.mesh is not None:
+    current_mesh = pxla.thread_resources.env.physical_mesh
+    if meta.mesh is not current_mesh:
+      raise ValueError(
+          f'Internal metadata uses a different mesh ({meta.mesh}) than the one'
+          f' currently being used ({current_mesh})'
+      )
+    param.mesh_shape = meta.mesh.devices.shape
+
+  if meta.mesh_axes:
+    repeat_shardings = meta.mesh_axes[: len(repeat_prefix)]
+    non_repeat_shardings = meta.mesh_axes[len(repeat_prefix) :]
+    param.tensor_split_dims_mapping = non_repeat_shardings or None
+    param.repeat_prefix_split_dims_mapping = repeat_shardings or None
+
+  param.repeat_prefix = tuple(repeat_prefix) or None
+  param.fan_in_axes = tuple(fan_in_axes) or None
+
+  # TODO(laigd): handle these.
+  # param.repeat_optimizer_dims_mapping
+  # param.fan_out_axes
+  # param.collections
+
+  return param
 
 
 def unbox_meta(tree):
@@ -968,11 +1089,11 @@ def unbox_meta(tree):
   def extract_meta(bp):
     if isinstance(bp, BoxedParam):
       return bp.meta
+    elif _is_internal_meta(bp):
+      return _internal_meta_to_hparams(bp)
     return WeightHParams(shape=bp.shape, dtype=bp.dtype)
 
-  return jax.tree_map(
-      extract_meta, tree, is_leaf=lambda x: isinstance(x, BoxedParam)
-  )
+  return jax.tree_util.tree_map(extract_meta, tree, is_leaf=_is_meta)
 
 
 class SummaryType(enum.Enum):
@@ -1567,7 +1688,7 @@ class BaseLayer(nn.Module):
     out: SplitDimsMapping = None
 
   dtype: jnp.dtype = jnp.float32
-  fprop_dtype: Any | None = None
+  fprop_dtype: jnp.dtype | None = None
   params_init: WeightInit = instance_field(default_param_init)
   skip_lp_regularization: bool | None = None
   ici_mesh_shape: Sequence[int] | None = None
@@ -1577,8 +1698,8 @@ class BaseLayer(nn.Module):
   shared_weight_layer_id: str | None = None
   # TODO(b/249483164): Change these to use instance_field rather than
   # template_field after the Fiddle migration.
-  weight_split_dims_mapping: pax_fiddle.Config[BaseLayer.WeightSharding] = template_field(
-      WeightSharding
+  weight_split_dims_mapping: pax_fiddle.Config[BaseLayer.WeightSharding] = (
+      template_field(WeightSharding)
   )
   activation_split_dims_mapping: pax_fiddle.Config[
       BaseLayer.ActivationSharding
@@ -1865,9 +1986,10 @@ class BaseLayer(nn.Module):
       method=None,
       extra_mutable_list=None,
       self_reflect_configs=False,
+      capture_intermediates: bool | Callable[[nn.Module, str], bool] = False,
       **kwargs,
   ) -> dict[str, NestedWeightHParams]:
-    # Dummy key is enough because we eval_shape only.
+    # The fixed rng key is good, because we eval_shape only.
     k = jax.random.PRNGKey(1)
     rngs = {PARAMS: k, RANDOM: k, NON_PAX_RNG_KEY: k}
     # Only PARAMS and NON_TRAINABLE have BoxedParam.
@@ -1879,7 +2001,10 @@ class BaseLayer(nn.Module):
     if extra_mutable_list is not None:
       mutable_list = [*mutable_list, *extra_mutable_list]
     init_fn = functools.partial(
-        super().init, mutable=mutable_list, method=method
+        super().init,
+        mutable=mutable_list,
+        method=method,
+        capture_intermediates=capture_intermediates,
     )
     # Disable logging to reduce logspam.
     with py_utils.logging_verbosity_level('FATAL'):
@@ -1888,8 +2013,12 @@ class BaseLayer(nn.Module):
       )
       with JaxContext.new_context(hparams=context_p):
         if self.fprop_dtype == jnp.bfloat16:
-          converted_args = jax.tree_map(_maybe_to_bfloat16_dtype, args)
-          converted_kwargs = jax.tree_map(_maybe_to_bfloat16_dtype, kwargs)
+          converted_args = jax.tree_util.tree_map(
+              _maybe_to_bfloat16_dtype, args
+          )
+          converted_kwargs = jax.tree_util.tree_map(
+              _maybe_to_bfloat16_dtype, kwargs
+          )
         else:
           converted_args = args
           converted_kwargs = kwargs
@@ -1902,12 +2031,19 @@ class BaseLayer(nn.Module):
   # the unpadded variable shapes and SPMD annotations for
   # PARAMS and NON_TRAINABLE collections.
   def abstract_init_with_metadata(
-      self, *args, do_eval=False, method=None, extra_mutable_list=None, **kwargs
+      self,
+      *args,
+      do_eval=False,
+      method=None,
+      extra_mutable_list=None,
+      capture_intermediates: bool | Callable[[nn.Module, str], bool] = False,
+      **kwargs,
   ) -> NestedWeightHParams:
     variables_abstract = self._abstract_init(
         *args,
         do_eval=do_eval,
         method=method,
+        capture_intermediates=capture_intermediates,
         extra_mutable_list=extra_mutable_list,
         **kwargs,
     )
@@ -1920,7 +2056,13 @@ class BaseLayer(nn.Module):
   # A systematic self-reflection of the model structure, with configs for the
   # nested tree of BaseLayers.
   def abstract_init_with_mdl_config(
-      self, *args, do_eval=False, method=None, extra_mutable_list=None, **kwargs
+      self,
+      *args,
+      do_eval=False,
+      method=None,
+      extra_mutable_list=None,
+      capture_intermediates: bool | Callable[[nn.Module, str], bool] = False,
+      **kwargs,
   ) -> Nested[pax_fiddle.Config[BaseLayer]]:
     variables_abstract = self._abstract_init(
         *args,
@@ -1928,9 +2070,10 @@ class BaseLayer(nn.Module):
         method=method,
         extra_mutable_list=extra_mutable_list,
         self_reflect_configs=True,
+        capture_intermediates=capture_intermediates,
         **kwargs,
     )
-    hyper_params = jax.tree_map(
+    hyper_params = jax.tree_util.tree_map(
         lambda x: x.meta,
         variables_abstract[HYPER_PARAMS],
         is_leaf=lambda x: isinstance(x, WrappedHParams),
@@ -2076,9 +2219,10 @@ class BaseLayer(nn.Module):
   @nn.nowrap
   def update_var(self, name: str, new_val: JTensor) -> None:
     """Update var 'name' in the forward pass."""
-    old_val = self.get_var(name)
+    old_val = super().get_variable(NON_TRAINABLE, name)
     if self.is_mutable_collection(NON_TRAINABLE) and not self.is_initializing():
-      asserts.eq(old_val.shape, new_val.shape)
+      asserts.eq(maybe_unbox_value(old_val).shape, new_val.shape)
+      new_val = flax_core.meta.replace_boxed(old_val, new_val)
       self.put_variable(NON_TRAINABLE, name, new_val)
 
   @nn.nowrap

@@ -126,12 +126,10 @@ class BaseInput(base_hyperparams.FiddleBaseParameterizable):
       that all variant self.infeed_host_index instances raise after the same
       number of calls to get_next() to ensure synchronization across hosts. If
       not set, get_next() must never raise.
-    eval_loop_num_batches: Num of batches to process per eval loop. Must be >=
-      1. This value is ignored if reset_for_eval is set True, in which case,
-      this value is dynamically determined by the number of available batches.
-      If reset_for_eval is set to False, then each eval loop will process this
-      many batches. Metrics over those batches will be aggregated and then
-      reported.
+    eval_loop_num_batches: An integer representing the number of batches to
+      process per eval loop. If >= 1, each eval loop will process this many
+      batches. Metrics over those batches will be aggregated and then reported.
+      If set to `-1`, each eval loop will use all batches.
     is_training: Whether or not this dataset is used for model traning.
     experimental_remote_input: whether to process inputs on remote hosts, when
       there is a single controller.
@@ -189,6 +187,15 @@ class BaseInput(base_hyperparams.FiddleBaseParameterizable):
           f'Input params self.name string invalid: "{name}" '
           f'does not fully match "{_NAME_REGEX}".'
       )
+    if (
+        self.eval_loop_num_batches
+        and self.eval_loop_num_batches <= 0
+        and self.eval_loop_num_batches != -1
+    ):
+      raise ValueError(
+          'eval_loop_num_batches must be positive, -1, found'
+          f' {self.eval_loop_num_batches}.'
+      )
     if self.experimental_remote_input and jax.process_count() > 1:
       raise NotImplementedError(
           'Remote input is not supported when there are multiple controllers.')
@@ -220,6 +227,11 @@ class BaseInput(base_hyperparams.FiddleBaseParameterizable):
   def get_state(self) -> bytes:
     """Returns the serialized state as bytes object."""
     if self._peek is not None:
+      if not self._state_before_peek:
+        raise ValueError(
+            'get_state() should only be used when input_checkpointing_enabled ='
+            ' True. Otherwise, the peeked iterator state will not be captured.'
+        )
       return self._state_before_peek
     return self._get_state_internal()
 
@@ -1119,31 +1131,3 @@ class DatasetInputSpecsProvider(BaseInputSpecsProvider):
   def get_input_specs(self) -> NestedShapeDtypeStruct:
     """Returns example input specs from the input pipeline for model init."""
     return self._input_specs
-
-
-def distributed_builder(fn: Any) -> Any:  # Any to avoid user PyType errors.
-  """Annotates a function that promises to return a BaseInput instance.
-
-  This is used in conjunection with `DistributedInputHParams` type below.
-
-  Args:
-    fn: The function to annotate.
-
-  Returns:
-    The function `fn` (that has now been annotated).hg st
-  """
-  assert inspect.isfunction(fn)
-  setattr(fn, '_am_input_hparam_type_promise', True)
-  return fn
-
-
-class DistributedInputHParamsMeta(type):
-
-  def __instancecheck__(cls, instance):
-    return isinstance(instance, pax_fiddle.Config) and hasattr(
-        fdl.get_callable(instance), '_am_input_hparam_type_promise'
-    )
-
-
-class DistributedInputHParams(metaclass=DistributedInputHParamsMeta):
-  pass

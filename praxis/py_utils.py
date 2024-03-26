@@ -22,7 +22,7 @@ import inspect
 import re
 import threading
 import time
-from typing import Any, Callable, Dict, Iterable, Iterator, NamedTuple, Sequence
+from typing import Any, Callable, Dict, Iterable, Iterator, Mapping, NamedTuple, Sequence
 
 from absl import flags
 from absl import logging
@@ -31,11 +31,13 @@ import jax
 from jax import lax
 from jax.experimental import mesh_utils
 from jax.experimental import multihost_utils
+from jax.interpreters import pxla
 import jax.numpy as jnp
 import numpy as np
 import optax
 from praxis import lingvo_lib
 from praxis import pytypes
+from praxis import trees
 
 flags.DEFINE_bool(
     'pmap_use_tensorstore', False,
@@ -63,21 +65,6 @@ HParams = pytypes.HParams
 Nested = pytypes.Nested
 
 JTensor = jnp.ndarray
-
-
-# A utility function to flatten copied from jax/_src/util.py
-def _unzip2(xys):
-  xs = []
-  ys = []
-  for x, y in xys:
-    xs.append(x)
-    ys.append(y)
-  return tuple(xs), tuple(ys)
-
-
-jax.tree_util.register_pytree_node(NestedMap,
-                                   lambda xs: _unzip2(sorted(xs.items()))[::-1],
-                                   lambda keys, xs: NestedMap(zip(keys, xs)))
 
 
 def merge_dict(dict1, dict2):
@@ -124,10 +111,15 @@ def _nested_map_from_state_dict(
 ) -> NestedMap:
   return NestedMap(flax.serialization.from_state_dict(dict(xs), states))
 
-
-flax.serialization.register_serialization_state(NestedMap,
-                                                _nested_map_to_state_dict,
-                                                _nested_map_from_state_dict)
+try:
+  flax.serialization.register_serialization_state(
+      NestedMap, _nested_map_to_state_dict, _nested_map_from_state_dict
+  )
+except ValueError:
+  logging.error(
+      'ValueError: a serialization handler for "NestedMap" is already'
+      ' registered'
+  )
 
 
 @functools.partial(functools.partial, jax.tree_map)
@@ -365,7 +357,8 @@ def make_array(
     host_arrays: np.ndarray | Any,
     global_shapes: jax.ShapeDtypeStruct | Any,
     global_mesh: jax.sharding.Mesh,
-    pspecs: Any,
+    pspecs: Any | None = None,
+    sharding: Mapping[str, jax.sharding.Sharding] | None = None,
 ) -> Any:
   """Makes a Jax Array from host array.
 
@@ -375,12 +368,16 @@ def make_array(
     host_arrays: host-local arrays.
     global_shapes: global shapes of the resultant Array.
     global_mesh: global mesh of the resultant Array.
-    pspecs: partition specs of the resultant Array.
+    pspecs: Optional partition specs of the resultant Array.
+    sharding: Optional sharding of the resultant Array. Either pspecs or
+      sharding must be provided.
 
   Returns:
     A Jax Array with x as the host-local data.
   """
-
+  assert (pspecs is not None) != (
+      sharding is not None
+  ), 'Either pspecs or sharding must be provided.'
   local_devices = global_mesh.local_devices
 
   def _put_to_devices(x):
@@ -388,13 +385,16 @@ def make_array(
 
   device_buffers = jax.tree_map(_put_to_devices, host_arrays)
 
-  def _jax_array(global_shape, pspec, dbs):
-    # This is cached because creating new sharding objects everytime is
-    # expensive in pjit dispatch path for inputs.
-    s = jax.sharding.NamedSharding(global_mesh, pspec)
-    return jax.make_array_from_single_device_arrays(global_shape.shape, s, dbs)
+  def _jax_array(global_shape, dbs, sharding):
+    return jax.make_array_from_single_device_arrays(
+        global_shape.shape, sharding, dbs
+    )
 
-  return jax.tree_map(_jax_array, global_shapes, pspecs, device_buffers)
+  # If sharding not provided, create it from the partition spec.
+  sharding = sharding or jax.tree_map(
+      lambda x: jax.sharding.NamedSharding(global_mesh, x), pspecs
+  )
+  return jax.tree_map(_jax_array, global_shapes, device_buffers, sharding)
 
 
 def convert_fully_replicated_array_to_pmap_array(arr):
@@ -410,8 +410,8 @@ def convert_fully_replicated_array_to_pmap_array(arr):
   assert isinstance(arr, jax.Array)
   with jax.transfer_guard('disallow'):
     local_shape = (jax.local_device_count(),) + arr.shape
-    device_buffers = arr.device_buffers  # pytype: disable=attribute-error
-    devices = np.array([d.device() for d in device_buffers])
+    device_buffers = [shard.data for shard in arr.addressable_shards]
+    devices = np.array([shard.device for shard in arr.addressable_shards])
 
     s = jax.sharding.PmapSharding.default(
         local_shape, sharded_dim=0, devices=devices
@@ -430,7 +430,7 @@ def convert_host_local_array_to_global_array(arr):
     A global array similar to GDA.
   """
   # input `arr` is fully replicated, so it's shape is the global shape.
-  global_shape = arr.device_buffers[0].shape
+  global_shape = arr.addressable_data(0).shape
   # Create a 1D mesh to create fully replicated global jax.Array.
   mesh = jax.sharding.Mesh(np.array(jax.devices()), axis_names=('x',))
   partition_spec = (
@@ -439,7 +439,10 @@ def convert_host_local_array_to_global_array(arr):
       else jax.sharding.PartitionSpec()
   )
   # pmap-produced Array has a "scrambled" device order.
-  dbs = sorted(arr.device_buffers, key=lambda x: x.device().id)
+  dbs = sorted(
+      [shard.data for shard in arr.addressable_shards],
+      key=lambda x: list(x.devices())[0].id,
+  )
   return jax.make_array_from_single_device_arrays(
       global_shape, jax.sharding.NamedSharding(mesh, partition_spec), dbs
   )
@@ -467,7 +470,7 @@ def total_num_vars(variables) -> int:
 
 def global_mesh_defined() -> bool:
   """Checks if global xmap/pjit mesh resource environment is defined."""
-  maps_env = jax.experimental.maps.thread_resources.env
+  maps_env = pxla.thread_resources.env
   return maps_env.physical_mesh.devices.shape != ()  # pylint: disable=g-explicit-bool-comparison
 
 
@@ -589,28 +592,26 @@ def select_nodes_by_indices(indices, *trees):
 Patterns = str | re.Pattern | Iterable[re.Pattern | str]
 
 
-def match_variable_names(tree: NestedMap, patterns: Patterns) -> NestedMap:
+def match_variable_names(
+    tree: NestedMap,
+    patterns: Patterns,
+    is_leaf: Callable[..., bool] | None = None,
+) -> NestedMap:
   """Checks if a prefix key of each variable is matching to one of `patterns`.
 
   Args:
     tree: NestedMap to be matched against `patterns`.
     patterns: `re.Pattern`, `str` that can be compiled into `re.Pattern`, or an
       iterator of those.
+    is_leaf: an optional Callable returning a boolean. When it is true, the
+      prefix is replaced by None.
 
   Returns:
     A nested map with the same structure as `tree`. Each node of the tree is
     a boolean flag denoting whether the prefix name of the variable is matching
     to one of `patterns`.
   """
-  # Convert singleton to the list
-  if isinstance(patterns, (str, re.Pattern)):
-    patterns = [patterns]
-  # Compile (`re.compile` acts as an identity func when p is `Pattern`)
-  patterns = [re.compile(p) for p in patterns]
-
-  var_prefix = extract_prefixed_keys_from_nested_map(tree)
-  return jax.tree_map(
-      lambda x: any(p.fullmatch(x) is not None for p in patterns), var_prefix)
+  return trees.fullmatch_path(tree, patterns, is_leaf=is_leaf)
 
 
 def update_matched_variables(old_tree: NestedMap,
@@ -952,22 +953,21 @@ class RunningPeriod:
   @property
   def elapsed(self) -> float:
     """Returns the elapsed time in second."""
-    assert self.end is not None
-    return max(self.end - self.start, self.min_elapsed)
+    right_boundary = time.time() if self.end is None else self.end
+    return max(right_boundary - self.start, self.min_elapsed)
 
 
 @contextlib.contextmanager
 def timeit(min_elapsed: float = 1e-6) -> Iterator[RunningPeriod]:
-  """A context manager that times a running period.
+  """A context manager that times an interval of execution.
 
   Usage:
     with py_utils.timeit() as period:
-      run_logics()
-    period.elapsed
+      run_logic()
+    print(period.elapsed)
 
   Args:
-    min_elapsed: the minimal elapsed to use if elapsed is smaller than this
-      number.
+    min_elapsed: the smallest time interval (seconds) period.elapsed will yield.
 
   Yields:
     A `RunningPeriod` object that contains time information for execution

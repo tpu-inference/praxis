@@ -26,13 +26,33 @@ class XYZModel():
 class QuantizedXYZModel(XYZModel):
   pass
 
+# Mixed precision setup.
+@mixed_precision_for_transformer(
+    num_bits={
+        TransformerLayer.LINEAR: 4,
+        TransformerLayer.ATTENTION: 8,
+        TransformerLayer.EMBEDDING_SOFTMAX: 8,
+    },
+    sub_channel_blocksize={
+        TransformerLayer.LINEAR: 128,
+    },
+    dtype={
+        TransformerLayer.LINEAR: jnp.int4,
+    },
+    transposed_embedding_softmax=True,
+)
+class QuantizedXYZModel(XYZModel):
+  pass
+
+
 This creates a quantized model for the original XYZModel configuration by
 quantizing all transformer blocks.
-
 """
-import functools
-from typing import Sequence, Type, cast
 
+import functools
+from typing import Dict, Sequence, Type, cast
+
+from absl import logging
 import fiddle as fdl
 from jax import numpy as jnp
 from praxis import base_layer
@@ -43,7 +63,10 @@ from praxis.layers.quantization import quantization_hparams
 from praxis.layers.quantization import utils
 
 # Internal import for internal quantization hyper parameters.
+# Internal quantization helper.
 # Internal import for internal quantization long seq support.
+# Internal embedding implementation.
+
 
 LayerTpl = pax_fiddle.Config[base_layer.BaseLayer]
 QuantizationParams = quantization_hparams.QuantizationParams
@@ -51,53 +74,60 @@ QuantizationType = quantization_hparams.QuantizationType
 QuantizationMode = quantization_hparams.QuantizationMode
 WeightQuantizationParams = quantization_hparams.WeightQuantizationParams
 ActQuantizationParams = quantization_hparams.ActQuantizationParams
+TransformerLayer = quantization_hparams.TransformerLayer
 
 
 def _quantize_embedding_softmax_layer_weights(
-    layer_tpl: pax_fiddle.Config[layers.TransformerLm]
-    | pax_fiddle.Config[layers.TransformerEncoderDecoder],
+    layer_tpl: (
+        pax_fiddle.Config[layers.TransformerLm]
+        | pax_fiddle.Config[layers.TransformerEncoderDecoder]
+    ),
     quantization_type: QuantizationType,
     mode: QuantizationMode,
     weight_quantization_params: WeightQuantizationParams,
-    transposed_embedding_softmax: bool,
+    act_quantization_params: ActQuantizationParams | None = None,
+    transposed_embedding_softmax: bool = False,
     softmax_only: bool = True,
 ) -> None:
   """Rewrites Embedding HParam for weight only quantization."""
-  if transposed_embedding_softmax:
-    # Transposed embedding quantization.
-    # Replace softmax_tpl to quantized NClassMajorSharedEmbeddingSoftmax.
-    quant_embedding_softmax_tpl = pax_fiddle.Config(
-        quantization.NClassMajorSharedEmbeddingSoftmax,
-        quantization=QuantizationParams(
-            quantization_type=quantization_type,
-            mode=mode,
-            weight_params=weight_quantization_params,
-        ),
-    )
-  else:
-    # Non-transposed embedding quantization.
-    # Replace softmax_tpl to quantized SharedEmbeddingSoftmax.
-    quant_embedding_softmax_tpl = pax_fiddle.Config(
-        quantization.SharedEmbeddingSoftmax,
-        quantization=QuantizationParams(
-            quantization_type=quantization_type,
-            mode=mode,
-            weight_params=weight_quantization_params,
-        ),
-    )
+
+  quantization_params = QuantizationParams(
+      quantization_type=quantization_type,
+      mode=mode,
+      weight_params=weight_quantization_params,
+      act_params=act_quantization_params,
+  )
+
+  def _quantize_shared_embedding_softmax(embedding_softmax_tpl, name):
+    if transposed_embedding_softmax:
+      # Transposed embedding quantization.
+      # Replace softmax_tpl to quantized NClassMajorSharedEmbeddingSoftmax.
+      quant_embedding_softmax_tpl = pax_fiddle.Config(
+          quantization.NClassMajorSharedEmbeddingSoftmax,
+          quantization=quantization_params,
+      )
+    else:
+      # Non-transposed embedding quantization.
+      # Replace softmax_tpl to quantized SharedEmbeddingSoftmax.
+      quant_embedding_softmax_tpl = pax_fiddle.Config(
+          quantization.SharedEmbeddingSoftmax,
+          quantization=quantization_params,
+      )
+    new_embedding_softmax_tpl = quant_embedding_softmax_tpl.clone()
+    new_embedding_softmax_tpl.copy_fields_from(embedding_softmax_tpl)
+    setattr(layer_tpl, name, new_embedding_softmax_tpl)
 
   def _quantize(name: str):
     embedding_softmax_tpl = getattr(layer_tpl, name)
     if embedding_softmax_tpl is None:
       return
     if issubclass(embedding_softmax_tpl.cls, layers.SharedEmbeddingSoftmax):
-      new_embedding_softmax_tpl = quant_embedding_softmax_tpl.clone()
-      new_embedding_softmax_tpl.copy_fields_from(embedding_softmax_tpl)
-      setattr(layer_tpl, name, new_embedding_softmax_tpl)
+      _quantize_shared_embedding_softmax(embedding_softmax_tpl, name)
+ # Internal quantization support.
     else:
-      raise ValueError(
+      logging.info(
           f'layer_tpl.{name}.cls is : {embedding_softmax_tpl.cls}'
-          'but has to be layers.SharedEmbeddingSoftmax'
+          ' but has to be SharedSoftmaxEmbedding or MultiModalSoftmaxEmbedding.'
       )
 
   _quantize('softmax_tpl')
@@ -373,6 +403,7 @@ def for_transformer(
     # Internal quantization parameters.
     num_bits_act: int | None = None,
     use_symmetric_act: bool | None = None,
+    skip_transformers: list[str] | None = None,
 ):
   """Find and quantize transformer.
 
@@ -426,6 +457,8 @@ def for_transformer(
       valid when weight_quant_only is false.
     use_symmetric_act: Use symmetric activation quantization.Only valid when
       weight_quant_only is false.
+    skip_transformers: If not None, will skip quantizing transformers with the
+      name in this list.
 
   Returns:
     A modifier that quantizes transformers when applied to a config.
@@ -471,7 +504,110 @@ def for_transformer(
               softmax_only=softmax_only,
               use_symmetric_act=use_symmetric_act,
               num_bits_act=num_bits_act,
+              skip_transformers=skip_transformers,
           )
+        return task_p
+
+    return Wrapper
+
+  return decorator
+
+
+def mixed_precision_for_transformer(
+    quantization_type: QuantizationType = QuantizationType.PTQ,
+    mode: QuantizationMode = QuantizationMode.INFERENCE,
+    num_bits: Dict[TransformerLayer, int] = {},
+    sub_channel_blocksize: Dict[TransformerLayer, int] = {},
+    use_symmetric: Dict[TransformerLayer, bool] = {},
+    dtype: Dict[TransformerLayer, jnp.dtype] = {},
+    *,
+    default_sub_channel_blocksize: int = 0,
+    default_use_symmetric: bool = True,
+    default_dtype: jnp.dtype = jnp.int8,
+    transposed_embedding_softmax: bool = False,
+    quantize_self_attention: bool = True,
+    quantize_cross_attention: bool = True,
+):
+  """Decorator for quantizing trasformer with mixed precision setup.
+
+  Example usage:
+
+    @mixed_precision_for_transformer(
+        num_bits={
+            TransformerLayer.LINEAR: 4,
+            TransformerLayer.ATTENTION: 8,
+            TransformerLayer.EMBEDDING_SOFTMAX: 8,
+        },
+        sub_channel_blocksize={
+            TransformerLayer.LINEAR: 128,
+        },
+        dtype={
+            TransformerLayer.LINEAR: jnp.int4,
+        },
+        transposed_embedding_softmax=True,
+    )
+    class QuantizedXYZModel(XYZModel):
+      pass
+
+  Args:
+    quantization_type: Indicates the quantization type among PTQ, FQ, and AQT.
+    mode: Indicates the quantization mode. Only TRAINING and INFERENCE
+      (excluding MATERIALIZE) are valid for non-servable models.
+    num_bits: Dictionary that map the transformer layer name to number of bits
+      used in quantization. If the layer wasn't specified in num_bits, it is not
+      quantized.
+    sub_channel_blocksize: Dictionary that map the transformer layer name to
+      sub-channel quantization block size. If the key was missing, the
+      `default_sub_channel_blocksize` is chosen.
+    use_symmetric: Dictionary that map the transformer layer name to boolean
+      specifying symmetric (True) or asymmetric (False) quantization. If the key
+      was missing, `default_use_symmetric` is chosen.
+    dtype: Dictionary that map the transformer layer name to a jax.numpy type.
+      If the key was missing, `default_dtype` is chosen.
+    default_sub_channel_blocksize: default sub-channel block size.
+    default_use_symmetric: default use symmetric (True) or asymmetric (False).
+    default_dtype: default dtype.
+    transposed_embedding_softmax: If the model is using transposed embedding for
+      embedding softmax layer. This applies to both softmax and embedding
+      layers.
+    quantize_self_attention: Quantize the self attention layer inside the
+      transformer layer.
+    quantize_cross_attention: Quantize the cross attention layer inside the
+      transformer layer.
+  """
+
+  def decorator(cls):
+    """decorator that quantize transformers."""
+
+    @functools.wraps(cls, updated=())  # to keep original class name.
+    class Wrapper(cls):
+      """Wrapper class for cls with Quantization enabled."""
+
+      def task(self):
+        config = super()
+        config.set_quant_mode(mode)
+        task_p = config.task()
+        for k in num_bits.keys():
+          if num_bits[k] not in [2, 4, 8]:
+            raise ValueError(
+                f'Valid bits are 2, 4, 8, but Layer {k} is having'
+                f' {num_bits[k]} bits'
+            )
+        set_transformer_mixed_precision_quantization(
+            task_p.model,
+            quantization_type=quantization_type,
+            mode=mode,
+            num_bits=num_bits,
+            sub_channel_blocksize=sub_channel_blocksize,
+            use_symmetric=use_symmetric,
+            dtype=dtype,
+            default_sub_channel_blocksize=default_sub_channel_blocksize,
+            default_use_symmetric=default_use_symmetric,
+            default_dtype=default_dtype,
+            transposed_embedding_softmax=transposed_embedding_softmax,
+            quantize_self_attention=quantize_self_attention,
+            quantize_cross_attention=quantize_self_attention,
+        )
         return task_p
 
     return Wrapper
@@ -578,6 +714,7 @@ def set_transformer_quantization(
     # Internal quantization parameters.
     num_bits_act: int | None = None,
     use_symmetric_act: bool | None = None,
+    skip_transformers: list[str] | None = None,
 ):
   """Sets quantization params for TransformerLm or TransformerEncoderDecoder.
 
@@ -625,6 +762,8 @@ def set_transformer_quantization(
       valid when weight_quant_only is false.
     use_symmetric_act: Use symmetric activation quantization. Only valid when
       weight_quant_only is false.
+    skip_transformers: If not None, will skip quantizing transformers with the
+      name in this list.
   """
   weight_quantization_params = WeightQuantizationParams(
       precision=num_bits,
@@ -659,6 +798,14 @@ def set_transformer_quantization(
   transformer_tpls = utils.find_target_tpl(
       config, layers.transformers.Transformer
   )
+  if skip_transformers is not None:
+    match_transformers = []
+    for transformer_tpl in transformer_tpls:
+      if transformer_tpl.name in skip_transformers:
+        continue
+      match_transformers.append(transformer_tpl)
+    transformer_tpls = match_transformers
+
   for transformer_tpl in transformer_tpls:
     quantize_transformer_layer_weights(
         transformer_tpl,
@@ -683,6 +830,7 @@ def set_transformer_quantization(
             quantization_type,
             mode,
             weight_quantization_params,
+            act_quantization_params,
             transposed_embedding_softmax,
             softmax_only,
         )  # pytype: disable=wrong-arg-types  # py310-upgrade
@@ -693,6 +841,135 @@ def set_transformer_quantization(
             mode,
             weight_quantization_params,
         )  # pytype: disable=wrong-arg-types  # py310-upgrade
+
+
+def set_transformer_mixed_precision_quantization(
+    config: LayerTpl,
+    quantization_type: QuantizationType = QuantizationType.PTQ,
+    mode: QuantizationMode = QuantizationMode.INFERENCE,
+    num_bits: Dict[TransformerLayer, int] = {},
+    sub_channel_blocksize: Dict[TransformerLayer, int] = {},
+    use_symmetric: Dict[TransformerLayer, bool] = {},
+    dtype: Dict[TransformerLayer, jnp.dtype] = {},
+    *,
+    default_sub_channel_blocksize: int = 0,
+    default_use_symmetric: bool = True,
+    default_dtype: jnp.dtype = jnp.int8,
+    transposed_embedding_softmax: bool = False,
+    quantize_self_attention: bool = True,
+    quantize_cross_attention: bool = True,
+):
+  """Sets mixed precision quantization parameters for transformers.
+
+  Args:
+    config: The config to apply quantization on.
+    quantization_type: Indicates the quantization type among PTQ, FQ, and AQT.
+    mode: Indicates the quantization mode. Only TRAINING and INFERENCE
+      (excluding MATERIALIZE) are valid for non-servable models.
+    num_bits: Dictionary that map the transformer layer name to number of bits
+      used in quantization. If the layer wasn't specified in num_bits, it is not
+      quantized.
+    sub_channel_blocksize: Dictionary that map the transformer layer name to
+      sub-channel quantization block size. If the key was missing, the
+      `default_sub_channel_blocksize` is chosen.
+    use_symmetric: Dictionary that map the transformer layer name to boolean
+      specifying symmetric (True) or asymmetric (False) quantization. If the key
+      was missing, `default_use_symmetric` is chosen.
+    dtype: Dictionary that map the transformer layer name to a jax.numpy type.
+      If the key was missing, `default_dtype` is chosen.
+    default_sub_channel_blocksize: default sub-channel block size.
+    default_use_symmetric: default use symmetric (True) or asymmetric (False).
+    default_dtype: default dtype.
+    transposed_embedding_softmax: If the model is using transposed embedding for
+      embedding softmax layer. This applies to both softmax and embedding
+      layers.
+    quantize_self_attention: Quantize the self attention layer inside the
+      transformer layer.
+    quantize_cross_attention: Quantize the cross attention layer inside the
+      transformer layer.
+  """
+
+  def _build_weight_params(layer_type: TransformerLayer):
+    runtime_dtype = dtype.get(layer_type, default_dtype)
+    use_int4_packed_weights = False if runtime_dtype == jnp.int4 else True
+    return WeightQuantizationParams(
+        precision=num_bits[layer_type],
+        use_symmetric=use_symmetric.get(layer_type, default_use_symmetric),
+        dtype=runtime_dtype,
+        use_int4_packed_weights=use_int4_packed_weights,
+        block_size=sub_channel_blocksize.get(
+            layer_type, default_sub_channel_blocksize
+        ),
+    )
+
+  def _build_act_params(layer_type: TransformerLayer):
+    if layer_type in num_bits:
+      return ActQuantizationParams(
+          precision=num_bits[layer_type],
+          symmetric=use_symmetric.get(layer_type, default_use_symmetric),
+      )
+    else:
+      return None
+
+  transformer_tpls = utils.find_target_tpl(
+      config, layers.transformers.Transformer
+  )
+  # FFN
+  if TransformerLayer.LINEAR in num_bits:
+    weight_params = _build_weight_params(TransformerLayer.LINEAR)
+    act_params = _build_act_params(TransformerLayer.LINEAR_ACT)
+    for transformer_tpl in transformer_tpls:
+      transformer_ff_tpl = cast(
+          pax_fiddle.Config[layers.transformers.TransformerFeedForward],
+          transformer_tpl.tr_fflayer_tpl,
+      )
+      quantize_transformer_feed_forward_layer_weights(
+          transformer_ff_tpl,
+          quantization_type,
+          mode,
+          weight_params,
+          act_params,
+      )
+  # Attention
+  if TransformerLayer.ATTENTION in num_bits:
+    weight_params = _build_weight_params(TransformerLayer.ATTENTION)
+    act_params = _build_act_params(TransformerLayer.ATTENTION_ACT)
+    for transformer_tpl in transformer_tpls:
+      quantize_attention_layer_weights(
+          transformer_tpl,
+          quantization_type,
+          mode,
+          weight_params,
+          act_params,
+          quantize_self_attention,
+          quantize_cross_attention,
+      )  # pytype: disable=wrong-arg-types  # py310-upgrade
+  # Embedding
+  lm_or_encdec_tpls = utils.find_target_tpl(
+      config, [layers.TransformerLm, layers.TransformerEncoderDecoder]
+  )
+  if TransformerLayer.EMBEDDING_SOFTMAX in num_bits:
+    weight_params = _build_weight_params(TransformerLayer.EMBEDDING_SOFTMAX)
+    act_params = _build_act_params(TransformerLayer.EMBEDDING_SOFTMAX_ACT)
+    for lm_or_encdec_tpl in lm_or_encdec_tpls:
+      _quantize_embedding_softmax_layer_weights(
+          lm_or_encdec_tpl,
+          quantization_type,
+          mode,
+          weight_params,
+          act_quantization_params=act_params,
+          transposed_embedding_softmax=transposed_embedding_softmax,
+          softmax_only=True,
+      )  # pytype: disable=wrong-arg-types  # py310-upgrade
+  if TransformerLayer.EMBEDDING_NGRAMMER in num_bits:
+    weight_params = _build_weight_params(TransformerLayer.EMBEDDING_NGRAMMER)
+    for lm_or_encdec_tpl in lm_or_encdec_tpls:
+      _quantize_ngrammer_embedding_weights(
+          lm_or_encdec_tpl,
+          quantization_type,
+          mode,
+          weight_params,
+      )  # pytype: disable=wrong-arg-types  # py310-upgrade
 
 
 def set_diffusion_quantization(

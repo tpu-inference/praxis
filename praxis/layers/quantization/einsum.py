@@ -42,6 +42,7 @@ class Einsum(quantizer.QuantizationLayer):
   eqn: str = ''
   w_shape: Sequence[int] = ()
   use_bias: bool = False
+  _PACK_4BIT_DIM = 0
 
   def setup(self) -> None:
     operands, out = self.eqn.split('->')
@@ -58,16 +59,15 @@ class Einsum(quantizer.QuantizationLayer):
         tensor_split_dims_mapping=w_sharding,
     )
     out_bias_dims = sorted(out.index(d) for d in (set(out) - set(x)))
-    # Fan-out dims must be at the end of `out`.
-    assert all(d >= len(out) - len(out_bias_dims) for d in out_bias_dims)
     bias_shape = [self.w_shape[w.index(out[d])] for d in out_bias_dims]
     self.set_up_weights(
         weight_name='w',
         weight_params=pc,
         scale_shape=bias_shape,
-        pack_dim=0,
     )
     if self.use_bias:
+      # Fan-out dims must be at the end of `out`.
+      assert all(d >= len(out) - len(out_bias_dims) for d in out_bias_dims)
       if w_sharding is not None:
         b_sharding = [w_sharding[w.index(out[d])] for d in out_bias_dims]
       else:
@@ -93,7 +93,6 @@ class Einsum(quantizer.QuantizationLayer):
         eqn=self.eqn,
         x=inputs,
         w=self.theta.w,
-        pack_dim=0,
         reshape=[],
     )
     if self.use_bias:

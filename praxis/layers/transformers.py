@@ -93,7 +93,7 @@ def compute_attention_masks_for_fprop(
       ready to add to logits (optional).
     cross_inputs: Output JTensor of the encoder, to be used for cross attention,
       of shape [B, S, H].
-    cross_paddings: Paddings JTensor for cross atention of shape [B, S].
+    cross_paddings: Paddings JTensor for cross attention of shape [B, S].
     cross_segment_mask: Segment mask JTensor for encoder-decoder in packed input
       case of shape [B, 1, T, S].
     fold_padding_with_segment_mask: If True then segment mask is supposed to
@@ -280,7 +280,7 @@ class TransformerFeedForward(base_layer.BaseLayer):
       residual_weight + x.
     residual_droppath_prob: Probability at which we drop the entire residual
       path.
-    norm_policy: Policy for applying normaliztion wrt. transformations. Options
+    norm_policy: Policy for applying normalization wrt. transformations. Options
       are: (1) "pre", applied before transformation. (2) "primer_hybrid",
         applied before and after transformation. (3) "post", applied after
         transformation, (4) "post_skip", applied after the skip connection.
@@ -329,7 +329,9 @@ class TransformerFeedForward(base_layer.BaseLayer):
     """
 
     ffn0: SplitDimsMapping = None
+    ffn0_extend_step: SplitDimsMapping = None
     ffn1: SplitDimsMapping = None
+    ffn1_extend_step: SplitDimsMapping = None
 
   def setup(self) -> None:
     output_dims = self.output_dims
@@ -376,6 +378,8 @@ class TransformerFeedForward(base_layer.BaseLayer):
     ffn1_p.output_dims = self.hidden_dims
     ffn1_p.weight_split_dims_mapping.wt = wp.ffn0
     ffn1_p.activation_split_dims_mapping.out = ap.ffn0
+    if hasattr(ffn1_p.activation_split_dims_mapping, 'extend_step_out'):
+      ffn1_p.activation_split_dims_mapping.extend_step_out = ap.ffn0_extend_step
     ffn1_p.checkpoint_str = 'ffn1'
     if self.internal_gshard_variance_scaling_fan_in_init:
       scale = (1.0 / self.input_dims) ** 0.5 * (3.0**0.5)
@@ -392,6 +396,11 @@ class TransformerFeedForward(base_layer.BaseLayer):
       gate_p.output_dims = self.hidden_dims
       gate_p.weight_split_dims_mapping.wt = wp.ffn0
       gate_p.activation_split_dims_mapping.out = ap.ffn0
+      gate_p.checkpoint_str = 'ffn1_gate'
+      if hasattr(gate_p.activation_split_dims_mapping, 'extend_step_out'):
+        gate_p.activation_split_dims_mapping.extend_step_out = (
+            ap.ffn0_extend_step
+        )
       if self.internal_gshard_variance_scaling_fan_in_init:
         scale = (1.0 / self.input_dims) ** 0.5 * (3.0**0.5)
         gate_p.linear_tpl.params_init = WeightInit.Uniform(scale)
@@ -411,6 +420,8 @@ class TransformerFeedForward(base_layer.BaseLayer):
     ffn2_p.output_dims = output_dims
     ffn2_p.weight_split_dims_mapping.wt = wp.ffn1
     ffn2_p.activation_split_dims_mapping.out = ap.ffn1
+    if hasattr(ffn2_p.activation_split_dims_mapping, 'extend_step_out'):
+      ffn2_p.activation_split_dims_mapping.extend_step_out = ap.ffn1_extend_step
     if self.internal_gshard_variance_scaling_fan_in_init:
       scale = (1.0 / self.hidden_dims) ** 0.5 * (3.0**0.5)
       ffn2_p.linear_tpl.params_init = WeightInit.Uniform(scale)
@@ -429,6 +440,33 @@ class TransformerFeedForward(base_layer.BaseLayer):
           survival_prob=1.0 - self.residual_droppath_prob,
       )
       self.create_child('residual_droppath', droppath_p)
+
+  def _compute_ffns(self, inputs, paddings, ap_ff0=None):
+    # Apply first FFN layer
+    if self._is_ffn1_gated:
+      # theta.ffn_layer1_gate corresponds to gshard_builder's wi0
+      gate_value = self.ffn_layer1_gate(inputs)
+      # theta.ffn_layer1 corresponds to gshard_builder's wi1
+      activations = gate_value * self.ffn_layer1(inputs)
+    else:
+      activations = self.ffn_layer1(inputs)
+
+    activations = base_layer.maybe_shard(
+        activations, ap_ff0, self.mesh_axis_names
+    )
+
+    # Apply paddings if not None
+    if not self.apply_padding_first and paddings is not None:
+      activations *= 1.0 - paddings
+
+    self.add_summary('activation_rms', _rms(activations), verbosity=4)
+
+    # Apply RELU dropout
+    activations = self.relu_dropout(activations)
+
+    # Apply second FFN layer
+    outputs = self.ffn_layer2(activations)
+    return outputs
 
   def __call__(
       self,
@@ -454,26 +492,22 @@ class TransformerFeedForward(base_layer.BaseLayer):
     if self.norm_policy in ('primer_hybrid', 'pre'):
       self.add_summary('input_norm_rms', _rms(inputs), verbosity=4)
 
-    # Apply first FFN layer
-    if self._is_ffn1_gated:
-      # theta.ffn_layer1_gate corresponds to gshard_builder's wi0
-      gate_value = self.ffn_layer1_gate(inputs)
-      # theta.ffn_layer1 corresponds to gshard_builder's wi1
-      activations = gate_value * self.ffn_layer1(inputs)
-    else:
-      activations = self.ffn_layer1(inputs)
+    ap = self.activation_split_dims_mapping
+    ap_ff0 = ap.ffn0  # a_blf or a_bf
+    ap_ff1 = ap.ffn1  # a_bld or a_bd
+    if inputs.ndim == 2:
+      if ap.ffn0_extend_step is not None and len(ap.ffn0_extend_step) == 2:
+        ap_ff0 = ap.ffn0_extend_step
+      elif ap_ff0 is not None and len(ap_ff0) == 3:
+        ap_ff0 = [ap_ff0[0], ap_ff0[2]]
+      if ap.ffn1_extend_step is not None and len(ap.ffn1_extend_step) == 2:
+        ap_ff1 = ap.ffn1_extend_step
+      elif ap_ff1 is not None and len(ap_ff1) == 3:
+        ap_ff1 = [ap_ff1[0], ap_ff1[2]]
 
-    # Apply paddings if not None
-    if not self.apply_padding_first and paddings is not None:
-      activations *= 1.0 - paddings
-
-    self.add_summary('activation_rms', _rms(activations), verbosity=4)
-
-    # Apply RELU dropout
-    activations = self.relu_dropout(activations)
-
-    # Apply second FFN layer
-    outputs = self.ffn_layer2(activations)
+    inputs = base_layer.maybe_shard(inputs, ap_ff1, self.mesh_axis_names)
+    outputs = self._compute_ffns(inputs, paddings, ap_ff0)
+    outputs = base_layer.maybe_shard(outputs, ap_ff1, self.mesh_axis_names)
     outputs = checkpoint_name(outputs, 'ffn2')
 
     # Apply paddings if not None
@@ -509,7 +543,7 @@ class TransformerFeedForward(base_layer.BaseLayer):
       self.add_summary(
           'output_rel_cos', _rel_cos(residual, outputs), verbosity=4
       )
-
+    outputs = base_layer.maybe_shard(outputs, ap_ff1, self.mesh_axis_names)
     return outputs
 
   def extend_step(self, inputs: JTensor, *, time_step: JTensor) -> JTensor:
@@ -548,7 +582,7 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
     residual_weight: Weight applied on residual connection. Final output is
       residual_weight * residual_fn(x) + x. Only in effect when
       add_skip_connection is True.
-    norm_policy: Policy for applying normaliztion wrt. transformations. Options
+    norm_policy: Policy for applying normalization wrt. transformations. Options
       are: (1) "pre", applied before transformation. (2) "primer_hybrid",
         applied before and after transformation. (3) "post", applied after
         transformation.
@@ -557,8 +591,8 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
     gating_func: Gating function type--can be one of the following options:
       'top2', based on the GShard paper: https://arxiv.org/abs/2006.16668,
       'expert_choice', based on https://arxiv.org/abs/2202.09368, 'dense_top2':
-      experimental gating function for decodiing. Similar to 'top2' gating, but
-      no capacity constrainst for each expert.
+      experimental gating function for decoding. Similar to 'top2' gating, but
+      no capacity constraints for each expert.
     num_experts: Total number of experts in this layer.
     num_groups: Total number of groups for dispatching. num_groups typically
       should be the same as num devices.
@@ -776,7 +810,6 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
     ]
     wo_init = None
     if self.internal_gshard_variance_scaling_fan_in_init:
-      wi_init = None
       stddev = (1.0 / self.hidden_dims) ** 0.5
       wo_init_scale = stddev * 3.0**0.5
       wo_init = WeightInit.Uniform(wo_init_scale)
@@ -1168,7 +1201,7 @@ class Transformer(base_layer.BaseLayer):
       set to None, then cross-attention params will be inherited from
       tr_atten_tpl.
     ln_tpl: Parameterization of the layer normalization layer.
-    norm_policy: Policy for applying normaliztion wrt. transformations. Options
+    norm_policy: Policy for applying normalization wrt. transformations. Options
       are: (1) "pre", applied before transformation. (2) "primer_hybrid",
         applied before and after transformation. (3) "post", applied after
         transformation. (4) "post_skip", applied after the skip connection.
@@ -1339,7 +1372,6 @@ class Transformer(base_layer.BaseLayer):
     self.add_summary('xformer_input_abs_max', inputs_stats.max_v, verbosity=3)
 
     self.add_summary('attention_input_rms', _rms(inputs), verbosity=4)
-
     if self.norm_policy == 'primer_hybrid':
       inputs_normalized = self.pre_layer_norm(inputs)
     elif self.norm_policy == 'pre':
@@ -1467,11 +1499,27 @@ class Transformer(base_layer.BaseLayer):
     Returns:
       output: [B, D] or [B, L, D].
     """
+    a_bld = None
+    if hasattr(self.tr_fflayer_tpl.activation_split_dims_mapping, 'ffn1'):
+      ap = self.tr_fflayer_tpl.activation_split_dims_mapping
+      a_bld = ap.ffn1
+      if inputs.ndim == 2:
+        if ap.ffn1_extend_step is not None and len(ap.ffn1_extend_step) == 2:
+          a_bld = ap.ffn1_extend_step
+        elif a_bld is not None and len(a_bld) == 3:
+          a_bld = [a_bld[0], a_bld[2]]
+    inputs = base_layer.maybe_shard(inputs, a_bld, self.mesh_axis_names)
+
     # Layer normalize input
     if self.norm_policy == 'primer_hybrid':
       inputs_normalized = self.pre_layer_norm(inputs)
     elif self.norm_policy == 'pre':
       inputs_normalized = self.layer_norm(inputs)
+    else:
+      inputs_normalized = inputs
+    inputs_normalized = base_layer.maybe_shard(
+        inputs_normalized, a_bld, self.mesh_axis_names
+    )
 
     # Self-attention layer.
     atten_output = self.self_attention.extend_step(
@@ -1485,9 +1533,20 @@ class Transformer(base_layer.BaseLayer):
     elif self.norm_policy == 'post':
       atten_output = self.layer_norm(atten_output)
 
+    atten_output = base_layer.maybe_shard(
+        atten_output, a_bld, self.mesh_axis_names
+    )
+
     # Residual dropout and connection
     atten_output = self.residual_dropout(atten_output)
     atten_output += inputs
+
+    if self.norm_policy == 'post_skip':
+      atten_output = self.layer_norm(atten_output)
+
+    atten_output = base_layer.maybe_shard(
+        atten_output, a_bld, self.mesh_axis_names
+    )
 
     # Apply cross attention if applicable
     if self.use_cross_attention and (
@@ -1498,7 +1557,7 @@ class Transformer(base_layer.BaseLayer):
         atten_output_normalized = self.cross_layer_norm(atten_output)
       elif self.norm_policy == 'primer_hybrid':
         atten_output_normalized = self.pre_cross_layer_norm(atten_output)
-      elif self.norm_policy == 'post':
+      elif self.norm_policy in ('post', 'post_skip'):
         atten_output_normalized = atten_output
 
       cross_atten_output = self.cross_attention.extend_step(
@@ -1517,6 +1576,9 @@ class Transformer(base_layer.BaseLayer):
       # Residual dropout and connection
       cross_atten_output = self.residual_dropout(cross_atten_output)
       atten_output += cross_atten_output
+
+      if self.norm_policy == 'post_skip':
+        atten_output = self.cross_layer_norm(atten_output)
 
     # Apply FFN layer
     output = self.ff_layer.extend_step(atten_output, time_step=time_step)
@@ -1576,8 +1638,8 @@ class StackedTransformer(base_layer.BaseLayer):
     gating_func: Gating function type--can be one of the following options:
       'top2', based on the GShard paper: https://arxiv.org/abs/2006.16668,
       'expert_choice', based on https://arxiv.org/abs/2202.09368, 'dense_top2':
-      experimental gating function for decodiing. Similar to 'top2' gating, but
-      no capacity constrainst for each expert.
+      experimental gating function for decoding. Similar to 'top2' gating, but
+      no capacity constraints for each expert.
     unadjusted_expert_capacity_factor: Unadjusted expert capacity_factor. This
       is the ratio between global batch size and total capacity across all
       experts and all routing groups.
@@ -1590,7 +1652,7 @@ class StackedTransformer(base_layer.BaseLayer):
       non-PADs as another.
     moe_layer_tpl: Template configuration for the moe feedforward layer.
     num_experts: Total number of experts.
-    num_groups: Number of groups for dispathcing.
+    num_groups: Number of groups for dispatching.
     min_group_size: If not None, num_groups will be adjusted so that there will
       be at least min_group_size tokens in each group.
     moe_layers: List of MoE layer indices, e.g. [0, 2, 4].
@@ -1636,7 +1698,7 @@ class StackedTransformer(base_layer.BaseLayer):
   )
 
   def _clone_layer_params(self, layer_tpl: LayerTpl) -> LayerTpl:
-    """Useful to let sublasses switch the class (e.g. Streaming version)."""
+    """Useful to let subclasses switch the class (e.g. Streaming version)."""
     return layer_tpl.clone()
 
   def setup(self) -> None:
@@ -1739,7 +1801,7 @@ class StackedTransformer(base_layer.BaseLayer):
         add to logits.
       cross_inputs: Output of the encoder, to be used for cross attention, of
         shape [B, S, H].
-      cross_paddings: Paddings for cross atention of shape [B, S].
+      cross_paddings: Paddings for cross attention of shape [B, S].
       cross_segment_mask: Segment mask for encoder-decoder in packed input case
         of shape [B, 1, T, S].
       segment_pos: Segment pos for packed input of shape [B, T].
@@ -1822,7 +1884,7 @@ class StackedTransformer(base_layer.BaseLayer):
   ) -> JTensor:
     """Transformer stacked decoder layers, autoregressive cached decoding.
 
-    When `inputs` has shape [B, L, D], it will do extend_step on N tokenks per
+    When `inputs` has shape [B, L, D], it will do extend_step on N tokens per
     batch. This is used to do suffix scoring after autoregressive decoding.
 
     When `inputs` has shape [B, D], it will do extend_step on one token per
@@ -1950,6 +2012,11 @@ class StackedTransformerRepeated(base_layer.BaseLayer):
       optimizer state variables corresponding to the repeat prefix dims.
     nd_prefix_shape: If not None, there are multiple prefix dims of this shape
       and np.prod(nd_prefix_shape) == x_times.
+    return_intermediate_outputs: If True, the stacked transformer layers will
+      give output [L, B, N, C] where the first dimension contains all
+      intermediate features.
+    collect_intermediate_outputs: If True, makes outputs of underneath repeat
+      layers available for flax capture_intermediates.
   """
 
   block: LayerTpl = template_field(StackedTransformer)
@@ -1962,6 +2029,8 @@ class StackedTransformerRepeated(base_layer.BaseLayer):
   sublayer_name: str = 'sub'
   repeat_optimizer_dims_mapping: SplitDimsMapping = None
   nd_prefix_shape: Sequence[int] | None = None
+  return_intermediate_outputs: bool = False
+  collect_intermediate_outputs: bool = False
 
   class WeightSharding(base_layer.BaseLayer.WeightSharding):
     """Represents how layer's learned parameters are partitioned across a mesh.
@@ -1983,6 +2052,8 @@ class StackedTransformerRepeated(base_layer.BaseLayer):
         unpack_summaries=True,
         unroll_in_decode=self.unroll_in_decode,
         sublayer_name=self.sublayer_name,
+        collect_intermediate_outputs=self.collect_intermediate_outputs,
+        return_intermediate_outputs=self.return_intermediate_outputs,
         optimizer_dims_mapping=self.repeat_optimizer_dims_mapping,
         nd_prefix_shape=self.nd_prefix_shape,
     )
@@ -2013,7 +2084,7 @@ class StackedTransformerRepeated(base_layer.BaseLayer):
         add to logits.
       cross_inputs: Output of the encoder, to be used for cross attention, of
         shape [B, S, H].
-      cross_paddings: Paddings for cross atention of shape [B, S].
+      cross_paddings: Paddings for cross attention of shape [B, S].
       cross_segment_mask: Segment mask for encoder-decoder in packed input case
         of shape [B, 1, T, S].
       segment_pos: Segment position of shape [B, T].
@@ -2058,7 +2129,7 @@ class StackedTransformerRepeated(base_layer.BaseLayer):
   ) -> JTensor:
     """Transformer stacked decoder layers, autoregressive cached decoding.
 
-    When `inputs` has shape [B, L, D], it will do extend_step on N tokenks per
+    When `inputs` has shape [B, L, D], it will do extend_step on N tokens per
     batch. This is used to do suffix scoring after autoregressive decoding.
 
     When `inputs` has shape [B, D], it will do extend_step on one token per
@@ -2237,7 +2308,7 @@ class PipelinedTransformer(base_layer.BaseLayer):
         add to logits.
       cross_inputs: Output of the encoder, to be used for cross attention, of
         shape [B, S, H].
-      cross_paddings: Paddings for cross atention of shape [B, S].
+      cross_paddings: Paddings for cross attention of shape [B, S].
       cross_segment_mask: Segment mask for encoder-decoder in packed input case
         of shape [B, 1, T, S].
       segment_pos: Segment position of shape [B, T].

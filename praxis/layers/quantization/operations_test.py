@@ -22,12 +22,14 @@ from absl.testing import parameterized
 import jax
 from jax import numpy as jnp
 import numpy as np
+from opt_einsum import parser as einsum_parser
 from praxis import base_layer
 from praxis import pax_fiddle
 from praxis import test_utils
 from praxis.layers.quantization import operations
 from praxis.layers.quantization import quantization_hparams
 from praxis.layers.quantization import quantizer
+from praxis.layers.quantization import utils
 
 
 class QuantizationUtilsTest(test_utils.TestCase):
@@ -62,6 +64,28 @@ class QuantizationUtilsTest(test_utils.TestCase):
                          dtype=jnp.bfloat16)
     self.assertArraysEqual(ret, expected)
 
+  def test_quantized_einsum_swap_xw(self):
+    x = jnp.array([[1.0, 2.0, 3.0], [4.0, 1.0, 2.0]], dtype=jnp.bfloat16)
+    w = jnp.array([[1, 2, 1], [2, 1, 2], [1, 3, 1]], dtype=jnp.int8)
+    s = jnp.array([0.1, 0.2, 0.3], dtype=jnp.bfloat16)
+    # Multiplication without swap_xw
+    eqn = '...y,yz->...z'
+    ret = operations.einsum(eqn, x, w, s)
+    # Multiplication without swap_wx
+    eqn = 'yz,...y->...z'
+    ret_swap = operations.einsum(eqn, x, w, s, swap_xw=True)
+    self.assertArraysEqual(ret, ret_swap)
+
+  def test_int8_quantized_einsum(self):
+    x = jnp.array([[1, 2, 3], [4, 1, 2]], dtype=jnp.int8)
+    w = jnp.array([[1, 2, 1], [2, 1, 2], [1, 3, 1]], dtype=jnp.int8)
+    s = jnp.array([1, 2, 3], dtype=jnp.int8)
+    eqn = '...y,yz->...z'
+    # It will use dot_general with native int8 multiplication.
+    ret = operations.einsum(eqn, x, w, s)
+    expected = jnp.array([[8, 26, 24], [8, 30, 24]], dtype=jnp.int32)
+    self.assertArraysEqual(ret, expected)
+
   def test_quantized_einsum_with_expand_dim(self):
     # pylint: disable=invalid-name
     A, B, D, K, N, H = 6, 4, 5, 3, 7, 2
@@ -74,16 +98,45 @@ class QuantizationUtilsTest(test_utils.TestCase):
     expected = jnp.ones([K, A, B, N, H], dtype=jnp.bfloat16) * D
     self.assertArraysEqual(ret, expected)
 
-  @parameterized.parameters(jnp.int8, jnp.uint8)
-  def test_int_einsum(self, dtype):
-    # pylint: disable=invalid-name
-    A, D, H = 6, 5, 2
+  def test_native_int4_einsum_export(self):
+    A, D, H = 6, 5, 2  # pylint: disable=invalid-name
+    # jnp.zeros currently does not support dtype=jnp.int4
+    x = jnp.zeros([A, D], dtype=jnp.int8).astype(jnp.int4)
+    w = jnp.zeros([D, H], dtype=jnp.int8).astype(jnp.int4)
+    # (u)int4 does not support multiplication.
+    s = jnp.ones([H], dtype=jnp.int8)
 
-    x = jnp.ones([A, D], dtype=dtype)
-    w = jnp.ones([D, H], dtype=dtype)
-    s = jnp.ones([H], dtype=dtype)
+    # XLA CPU/GPU currently does not support int4 operations other than convert,
+    # so we validate that the exported compiler IR contains a dot_general with
+    # int4 operands and int32 accumulation instead.
+    wrapped_einsum = lambda x, w, s: operations.einsum('AD,DH->AH', x, w, s)
+    ir = jax.jit(wrapped_einsum).lower(x, w, s).compiler_ir('stablehlo')
+    self.assertRegex(str(ir), r'.*dot_general.*i4.*i4.*i32.*')
+
+  @parameterized.product(
+      x_dtype=[jnp.int4, jnp.uint4, jnp.int8, jnp.uint8, jnp.int16, jnp.uint16],
+      w_dtype=[jnp.int4, jnp.int8, jnp.int16],
+  )
+  def test_mixed_precision_int_einsum(self, x_dtype, w_dtype):
+    # TODO(b/183567451): Remove (u)int4 -> (u)int8 cast once XLA CPU supports
+    # int4 dtypes in dot_general.
+    if x_dtype in utils.INT4_TYPES:
+      x_dtype = utils.bits_to_dtype(
+          8, signed=jnp.issubdtype(x_dtype, jnp.signedinteger)
+      )
+    if w_dtype in utils.INT4_TYPES:
+      w_dtype = utils.bits_to_dtype(
+          8, signed=jnp.issubdtype(w_dtype, jnp.signedinteger)
+      )
+
+    A, D, H = 6, 5, 2  # pylint: disable=invalid-name
+    x = jnp.ones([A, D], dtype=x_dtype)
+    w = jnp.ones([D, H], dtype=w_dtype)
+    # (u)int4 does not support multiplication.
+    s = jnp.ones([H], dtype=jnp.int8)
 
     ret = operations.einsum('AD,DH->AH', x, w, s)
+    # Tests that int32 accumulation is used.
     expected = jnp.ones([A, H], dtype=jnp.int32) * D
     self.assertArraysEqual(ret, expected)
 
@@ -188,19 +241,41 @@ class QuantizationUtilsTest(test_utils.TestCase):
     self.assertEqual(operations.get_min_max(8, True, True), (-448.0, 448.0))
 
   @parameterized.named_parameters(
-      ('eqn1', 'AD,KDNH->KANH', 'A,KNH->KANH'),
-      ('eqn2', 'ANH,DNH->AD', 'A,D->AD'),
-      ('eqn3', '...y,yz->...z', '...,z->...z'),
-      ('eqn4', 'ABD,KDNH->KABNH', 'AB,KNH->KABNH'),
-      ('eqn5', 'ABNH,DNH->ABD', 'AB,D->ABD'),
-      ('eqn6', 'ABD,DNH->ABNH', 'AB,NH->ABNH'),
-      ('eqn7', 'AD,DNH->ANH', 'A,NH->ANH'),
-      ('eqn8', '...D,DH->...H', '...,H->...H'),
-      ('eqn9', '...y,zy->...z', '...,z->...z'),
+      (
+          'eqn1',
+          'AD,KDNH->KANH',
+          'AD,KNH->KANH',
+          [8, 16],
+          [2, 16, 4, 5],
+          [2, 4, 5],
+      ),
+      ('eqn2', 'ANH,DNH->AD', 'ANH,D->AD', [8, 4, 16], [20, 4, 16], [20]),
+      ('eqn3', '...y,yz->...z', '...y,z->...z', [8, 16], [16, 8], [8]),
+      (
+          'eqn4',
+          'ABD,KDNH->KABNH',
+          'ABD,KNH->KABNH',
+          [8, 4, 16],
+          [4, 16, 8, 8],
+          [4, 8, 8],
+      ),
+      ('eqn5', 'ABNH,DNH->ABD', 'ABNH,D->ABD', [4, 4, 4, 4], [16, 4, 4], [16]),
+      ('eqn6', 'ABD,DNH->ABNH', 'ABD,NH->ABNH', [4, 4, 4], [4, 4, 16], [4, 16]),
+      ('eqn7', 'AD,DNH->ANH', 'AD,NH->ANH', [8, 16], [16, 4, 4], [4, 4]),
+      ('eqn8', '...D,DH->...H', '...D,H->...H', [8, 8], [8, 16], [16]),
+      ('eqn9', '...y,zy->...z', '...y,z->...z', [16, 8], [8, 20], [20]),
   )
-  def test_offset_einsum(self, eqn, expected_offset_eqn):
-    offset_eqn = operations._get_offset_eqn(eqn)
-    self.assertEqual(offset_eqn, expected_offset_eqn)
+  def test_offset_einsum(
+      self, eqn, offset_eqn, input_dims, weight_dims, zp_dims
+  ):
+    x = np.random.rand(*input_dims).astype(np.float32)
+    w = np.random.rand(*weight_dims).astype(np.float32)
+    zp = np.random.rand(*zp_dims).astype(np.float32)
+    input_str, output_str, _ = einsum_parser.parse_einsum_input((eqn, x, w))
+    eqn_normalized = input_str + '->' + output_str
+    expected_offset = np.einsum(offset_eqn, x, zp)
+    offset = operations.compute_offset(eqn_normalized, x, zp)
+    self.assertAllClose(offset, expected_offset)
 
   def test_subchannel_einsum(self):
     x = np.random.rand(4, 2, 4).astype(np.float32)
@@ -261,6 +336,94 @@ class ReducePrecisionTest(test_utils.TestCase):
           scale, np.array([[0.04330709], [1.0]], dtype=np.float32)
       )
     self.assertIsNone(zp)
+
+  def test_precision_random(self):
+    inputs = np.array([[1.0, 2.0, 5.5, 2.9], [0.02, -0.01, 3.3, 4.0]])
+    qx, scale, zp = operations.reduce_precision(
+        inputs,
+        contract_dims=[1],
+        random_rounding=True,
+        key=jax.random.PRNGKey(0),
+    )
+
+    self.assertAllClose(
+        qx,
+        np.array([[23, 46, 127, 67], [0, 0, 104, 127]], dtype=np.int8),
+    )
+    self.assertAllClose(
+        scale, np.array([[0.04330709], [0.03149606]], dtype=np.float32)
+    )
+    self.assertIsNone(zp)
+
+  def test_binarization(self):
+
+    inputs = np.array([[1.0, -2.0, 5.5, 0.0], [0.02, -0.01, 3.3, 0.0]])
+    qx, scale, zp = operations.reduce_precision(
+        inputs, contract_dims=[1], bits=1, quant_method='bin'
+    )
+
+    # There must be no zeros.
+    self.assertFalse(np.any(qx == 0.0))
+
+    # Output array has only 1, -1
+    self.assertArraysEqual(
+        qx,
+        np.array(
+            [[1.0, -1.0, 1.0, 1.0], [1.0, -1.0, 1.0, 1.0]], dtype=np.float32
+        ),
+    )
+    self.assertAllClose(
+        scale, np.array([[2.1250002], [0.8325002]], dtype=np.float32)
+    )
+
+    self.assertIsNone(zp)
+
+    qx, scale, zp = operations.reduce_precision(
+        inputs, contract_dims=[1], bits=1, quant_method='bin_norm'
+    )
+    # There must be no zeros.
+    self.assertFalse(np.any(qx == 0.0))
+
+    # Output array has only 1, -1
+    self.assertArraysEqual(
+        qx,
+        np.array(
+            [[-1.0, -1.0, 1.0, -1.0], [-1.0, -1.0, 1.0, -1.0]], dtype=np.float32
+        ),
+    )
+    self.assertAllClose(
+        scale, np.array([[2.1875], [1.2362499]], dtype=np.float32)
+    )
+
+    self.assertIsNone(zp)
+
+    # Binarization with 'default' symmetric approach does not work: returns 0s
+    qx, _, _ = operations.reduce_precision(
+        inputs,
+        contract_dims=[1],
+        bits=1,
+        quant_method='default',
+        use_symmetric=True,
+    )
+    self.assertArraysEqual(
+        qx,
+        np.array([[0, 0, 0, 0], [0, 0, 0, 0]], dtype=np.int8),
+    )
+
+    # Binarization with 'default' asymmetric approach can work.
+    qx, scale, zp = operations.reduce_precision(
+        inputs,
+        contract_dims=[1],
+        bits=1,
+        quant_method='default',
+        use_symmetric=False,
+    )
+    self.assertArraysEqual(
+        qx,
+        np.array([[-1, -1, 0, -1], [-1, -1, 0, -1]], dtype=np.int8),
+    )
+    self.assertAllClose(scale, np.array([[7.5], [3.31]], dtype=np.float32))
+    self.assertAllClose(zp, np.array([[-5.5], [-3.3]], dtype=np.float32))
 
 
 class ReducePrecisionEinsumTest(test_utils.TestCase):
@@ -410,15 +573,28 @@ class ReducePrecisionEinsumTest(test_utils.TestCase):
         atol=0.02,
     )
 
-  def test_fakequant_with_block_size(self):
+  @parameterized.parameters(True, False)
+  def test_fakequant_with_block_size(self, use_symmetric):
     """Test fakequant with block size."""
     weight = np.random.normal(-0.5, 1.0, (12, 16)).astype(np.float32)
     eqn = '...y,yz->...z'
-    for use_symmetric in [True, False]:
-      weight_nudged = operations.fakequant_einsum(
-          eqn, weight, use_symmetric=use_symmetric, block_size=6
-      )
-      self.assertAllClose(weight, weight_nudged, rtol=0.01, atol=0.01)
+    weight_nudged = operations.fakequant_einsum(
+        eqn, weight, use_symmetric=use_symmetric, block_size=6
+    )
+    weight_fakequant = operations.fakequant_einsum(
+        eqn, weight, use_symmetric=use_symmetric, block_size=0
+    )
+    fakequant_error_block_size = jnp.sum(jnp.square(weight_nudged - weight))
+    fakequant_error = jnp.sum(jnp.square(weight_fakequant - weight))
+
+    if use_symmetric:  # Symmetric is less accurate.
+      self.assertLess(fakequant_error_block_size, 0.0033)
+      self.assertLess(fakequant_error, 0.0045)
+    else:
+      # With block_size it is more accurate.
+      self.assertLess(fakequant_error_block_size, 0.0015)
+      self.assertLess(fakequant_error, 0.0026)
+    self.assertAllClose(weight, weight_nudged, rtol=0.01, atol=0.01)
 
   def test_percentile(self):
     weight = np.random.normal(-2.0, 2.0, (4, 3)).astype(np.float32)
@@ -448,8 +624,18 @@ class ReducePrecisionEinsumTest(test_utils.TestCase):
   )
   def test_reduce_activation_precision_per_channel(self, eqn):
     act = np.random.normal(-1.0, 1.0, [10, 100]).astype(np.float32)
-    act_nudged = operations.fakequant_activation(act, eqn=eqn)
-    self.assertAllClose(act, act_nudged, rtol=0.02, atol=0.02)
+    act_per_channel_nudged = operations.fakequant_activation(
+        act, eqn=eqn, per_channel=True
+    )
+    act_per_tensor_nudged = operations.fakequant_activation(
+        act, eqn=eqn, per_channel=False
+    )
+    per_channel_diff = jnp.sum(jnp.abs(act - act_per_channel_nudged))
+    per_tensor_diff = jnp.sum(jnp.abs(act - act_per_tensor_nudged))
+    self.assertLess(per_channel_diff, 6.91)
+    self.assertLess(per_tensor_diff, 8.05)
+    self.assertAllClose(act, act_per_channel_nudged, rtol=0.02, atol=0.02)
+    self.assertAllClose(act, act_per_tensor_nudged, rtol=0.02, atol=0.02)
 
 
 def _generate_einsum_eqn() -> Sequence[dict[str, str]]:
@@ -695,6 +881,114 @@ class SubChannelTest(test_utils.TestCase):
     ]
     self.assertArraysEqual(new_shape, expected_shape)
 
+  def test_block_sub_channel_shape(self):
+    shape = [4, 16, 32, 64]
+    block_size = 8
+    new_shape, new_contract_dims = operations.get_sub_channel_shape(
+        shape, block_size, [2]
+    )
+    new_scale_shape = operations.get_scale_shape(new_shape, new_contract_dims)
+
+    # Contraction dim is replaced by two dims: remainder channels (4) and
+    # new contraction dim with block_size (8)
+    self.assertArraysEqual(new_shape, [4, 16, 4, 8, 64])
+    self.assertArraysEqual(new_scale_shape, [4, 16, 4, 64])
+
+    # New contract dim points to dim with block_size
+    self.assertArraysEqual(new_contract_dims, [3])
+
+  def test_block_sub_channel_shape_misaligned(self):
+    shape = [4, 16, 31, 64]
+    block_size = 8
+    new_shape, new_contract_dims = operations.get_sub_channel_shape(
+        shape, block_size, [2]
+    )
+    new_scale_shape = operations.get_scale_shape(new_shape, new_contract_dims)
+
+    # No changes in shape.
+    self.assertArraysEqual(new_shape, [4, 16, 31, 64])
+    self.assertArraysEqual(new_scale_shape, [4, 16, 64])
+    self.assertArraysEqual(new_contract_dims, [2])
+
+    with self.assertRaises(ValueError):
+      _, _ = operations.get_sub_channel_shape(
+          shape, block_size, [2], error_on_misaligned_shape=True
+      )
+
+  def test_insert_block_sub_channel_shape_several_contract_dims(self):
+
+    # Last contract dim is maximum.
+    shape = [4, 16, 32, 64]
+    block_size = 8
+    new_shape, new_contract_dims = operations.get_sub_channel_shape(
+        shape, block_size, [1, 2]
+    )
+    new_scale_shape = operations.get_scale_shape(new_shape, new_contract_dims)
+    self.assertArraysEqual(new_shape, [4, 16, 4, 8, 64])
+    self.assertArraysEqual(new_scale_shape, [4, 4, 64])
+    self.assertArraysEqual(new_contract_dims, [1, 3])
+
+    # If block_size is bigger than max reduction dim, new shape is not changed.
+    block_size = 128
+    new_shape, new_contract_dims = operations.get_sub_channel_shape(
+        shape, block_size, [1, 2]
+    )
+    new_scale_shape = operations.get_scale_shape(new_shape, new_contract_dims)
+    self.assertArraysEqual(new_shape, shape)
+    self.assertArraysEqual(new_scale_shape, [4, 64])
+    self.assertArraysEqual(new_contract_dims, [1, 2])
+
+    # First contract dim is maximum.
+    shape = [4, 32, 16, 64, 7]
+    block_size = 8
+    new_shape, new_contract_dims = operations.get_sub_channel_shape(
+        shape, block_size, [1, 2, 4]
+    )
+    new_scale_shape = operations.get_scale_shape(new_shape, new_contract_dims)
+    self.assertArraysEqual(new_shape, [4, 4, 8, 16, 64, 7])
+    self.assertArraysEqual(new_scale_shape, [4, 4, 64])
+    self.assertArraysEqual(new_contract_dims, [2, 3, 5])
+
+    # Middle contract dim is maximum.
+    shape = [4, 32, 16, 64, 7]
+    block_size = 8
+    new_shape, new_contract_dims = operations.get_sub_channel_shape(
+        shape, block_size, [1, 2, 3, 4]
+    )
+    new_scale_shape = operations.get_scale_shape(new_shape, new_contract_dims)
+    self.assertArraysEqual(new_shape, [4, 32, 16, 8, 8, 7])
+    self.assertArraysEqual(new_scale_shape, [4, 8])
+    self.assertArraysEqual(new_contract_dims, [1, 2, 4, 5])
+
+  def test_inplace_block_sub_channel_shape_several_contract_dims(self):
+
+    # Last contract dim is maximum.
+    shape = [4, 16, 32, 64]
+    block_size = 8
+    new_shape, new_contract_dims = operations.get_sub_channel_shape(
+        shape, block_size, [1, 2], insert_sub_channel=False
+    )
+    self.assertArraysEqual(new_shape, [16, 16, 8, 64])
+    self.assertArraysEqual(new_contract_dims, [1, 2])
+
+    # First contract dim is maximum.
+    shape = [4, 32, 16, 64, 7]
+    block_size = 8
+    new_shape, new_contract_dims = operations.get_sub_channel_shape(
+        shape, block_size, [1, 2, 4], insert_sub_channel=False
+    )
+    self.assertArraysEqual(new_shape, [16, 8, 16, 64, 7])
+    self.assertArraysEqual(new_contract_dims, [1, 2, 4])
+
+    # Middle contract dim is maximum.
+    shape = [4, 32, 16, 64, 7]
+    block_size = 8
+    new_shape, new_contract_dims = operations.get_sub_channel_shape(
+        shape, block_size, [1, 2, 3, 4], insert_sub_channel=False
+    )
+    self.assertArraysEqual(new_shape, [32, 32, 16, 8, 7])
+    self.assertArraysEqual(new_contract_dims, [1, 2, 3, 4])
+
 
 class ClipToFp16Test(test_utils.TestCase):
 
@@ -749,6 +1043,26 @@ class LowRankOperationsTest(test_utils.TestCase):
     self.assertArraysEqual(sv.shape, [inner_dim, 2])
     if rank > 3:
       self.assertAllClose(x, jnp.einsum('ij,jk->ik', u, sv))
+
+
+class FP4Test(test_utils.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    np.random.seed(0)
+
+  def test_fp4_round(self):
+    fp4 = operations.FP4()
+    tensor = jnp.array([[-26, 2.3], [33.3, 4.1]], dtype=jnp.float32)
+    expected_tensor = jnp.array([[-6, 2], [6, 4]], dtype=jnp.float32)
+    self.assertArraysEqual(fp4.round(tensor), expected_tensor)
+
+  def test_fp4_nudge(self):
+    t = jnp.array([[-0.5, 2.1], [0.3, 12.5]], dtype=jnp.float32)
+    self.assertAllClose(
+        operations.fakequant_einsum(t=t, eqn='ab,bc->ac', bits=4, use_fp=True),
+        t,
+    )
 
 
 if __name__ == '__main__':
