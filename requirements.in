@@ -7,9 +7,9 @@ chex>=0.1.85
 clu @ git+https://github.com/google/CommonLoopUtils
 einops
 etils
-fiddle @ git+https://github.com/google/fiddle
-flax @ git+https://github.com/google/flax
-jax @ git+https://github.com/google/jax
+fiddle==0.2.11 
+flax
+jax==0.4.18
 jax-bitempered-loss
 jaxtyping
 lingvo

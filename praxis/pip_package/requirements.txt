@@ -67,7 +67,7 @@ click==8.1.7
     # via
     #   tensorflow-datasets
     #   tfds-nightly
-clu @ git+https://github.com/google/CommonLoopUtils
+clu==0.0.10
     # via -r praxis-requirements.in
 comm==0.2.2
     # via
@@ -87,6 +87,7 @@ defusedxml==0.7.1
     # via nbconvert
 dm-tree==0.1.8
     # via
+    #   chex
     #   tensorflow-datasets
     #   tfds-nightly
 einops==0.7.0
@@ -108,7 +109,7 @@ executing==2.0.1
     # via stack-data
 fastjsonschema==2.19.1
     # via nbformat
-fiddle @ git+https://github.com/google/fiddle
+fiddle==0.2.11
     # via -r praxis-requirements.in
 flatbuffers==1.12
     # via tensorflow
@@ -174,7 +175,7 @@ ipywidgets==8.1.2
     # via jupyter
 isoduration==20.11.0
     # via jsonschema
-jax @ git+https://github.com/google/jax
+jax==0.4.18
     # via
     #   -r praxis-requirements.in
     #   chex
@@ -184,7 +185,7 @@ jax @ git+https://github.com/google/jax
     #   orbax-checkpoint
 jax-bitempered-loss==0.0.2
     # via -r praxis-requirements.in
-jaxlib==0.4.25
+jaxlib==0.4.18
     # via
     #   chex
     #   clu
